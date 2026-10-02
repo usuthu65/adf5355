@@ -49,7 +49,7 @@ Sequence-construction optimization:
 Corrected registers:
 
     Register 7  = 0x120000E7
-    Register 9  = 0x0302FCC9
+    Register 9  = calculated from fPFD for calibration timing
     Register 10 = calculated from fPFD
     Register 12 = 0x0001041C
 
@@ -159,7 +159,17 @@ TIMING_MARGIN_NS = 10_000
 NS_PER_SECOND = 1_000_000_000
 
 REGISTER_7_VALUE = 0x120000E7
-REGISTER_9_VALUE = 0x0302FCC9
+
+# Register 9 timing fields. These must be calculated from fPFD; a fixed
+# Register 9 value is not valid when the reference configuration changes.
+VCO_BAND_DIVIDER_MAX = 255
+TIMEOUT_MAX = 1023
+ALC_WAIT = 30
+SYNTHESIZER_LOCK_TIMEOUT = 12
+MIN_SYNTHESIZER_LOCK_SETTLING_NS = 20_000
+MIN_ALC_SETTLING_NS = 50_000
+VCO_BAND_SELECTION_MAX_HZ = 150_000
+VCO_BAND_SELECTION_CYCLES = 11
 
 PHASE_RESYNC_TIMEOUT = 0x041
 
@@ -951,8 +961,51 @@ def make_register_6(
     return value
 
 
-def make_register_9() -> int:
-    return REGISTER_9_VALUE
+def make_register_9(parameters: SynthesizerParameters) -> int:
+    """Build Register 9 with datasheet-compliant calibration timing."""
+    pfd_hz = parameters.pfd_hz
+
+    vco_band_divider = ceil_fraction(
+        pfd_hz / 2_400_000
+    )
+
+    # Register 9 requires at least 20 us for VTUNE/DAC settling. The
+    # ALC wait requirement is strict: it must be greater than 50 us.
+    minimum_timeout_for_synth_lock = ceil_fraction(
+        pfd_hz
+        * Fraction(
+            MIN_SYNTHESIZER_LOCK_SETTLING_NS,
+            NS_PER_SECOND * SYNTHESIZER_LOCK_TIMEOUT,
+        )
+    )
+    alc_timeout_threshold = (
+        pfd_hz
+        * Fraction(MIN_ALC_SETTLING_NS, NS_PER_SECOND)
+        / ALC_WAIT
+    )
+    minimum_timeout_for_alc = (
+        alc_timeout_threshold.numerator
+        // alc_timeout_threshold.denominator
+        + 1
+    )
+    timeout = max(
+        minimum_timeout_for_synth_lock,
+        minimum_timeout_for_alc,
+    )
+
+    if not 1 <= vco_band_divider <= VCO_BAND_DIVIDER_MAX:
+        raise ValueError("VCO band divider is outside the valid range")
+
+    if not 1 <= timeout <= TIMEOUT_MAX:
+        raise ValueError("Register 9 timeout is outside the valid range")
+
+    return (
+        (vco_band_divider << 24)
+        | (timeout << 14)
+        | (ALC_WAIT << 9)
+        | (SYNTHESIZER_LOCK_TIMEOUT << 4)
+        | REG_R9
+    )
 
 
 def make_register_10(parameters: SynthesizerParameters) -> int:
@@ -1000,7 +1053,7 @@ def make_register_map(
         ),
         REG_R7: REGISTER_7_VALUE,
         REG_R8: 0x102D0428,
-        REG_R9: make_register_9(),
+        REG_R9: make_register_9(parameters),
         REG_R10: make_register_10(parameters),
         REG_R11: 0x0061300B,
         REG_R12: make_register_12(),
@@ -2493,7 +2546,7 @@ def run_verification() -> None:
     assert registers[REG_R4] == 0x3200A584
     assert registers[REG_R6] == 0x15220076
     assert registers[REG_R7] == 0x120000E7
-    assert registers[REG_R9] == 0x0302FCC9
+    assert registers[REG_R9] == 0x1B1A7CC9
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
 
@@ -2511,6 +2564,16 @@ def run_verification() -> None:
     )
 
     assert differential_registers[REG_R4] == 0x3200A784
+
+    high_pfd_parameters = calculate_synthesizer_parameters(
+        1_800_000_000,
+        reference_hz=250_000_000,
+        reference_mode=REFERENCE_MODE_DIFFERENTIAL,
+        channel_spacing_hz=200_000,
+    )
+
+    assert high_pfd_parameters.pfd_hz == 125_000_000
+    assert make_register_9(high_pfd_parameters) == 0x35347CC9
 
     run_sequence_construction_regression_test()
     run_reuse_regression_test()
