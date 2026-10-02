@@ -6,12 +6,8 @@ Continuous ADF5355 frequency sweep driver for Raspberry Pi SPI0.
 
 There is no --sweep option and no --rf-output-hz option.
 
-The ADF5355 serial-interface CLK is permitted up to 50 MHz by the
-device datasheet. This script therefore permits:
-
-    --max-speed-hz <= 50_000_000
-
-The default remains 10 MHz.
+The ADF5355 serial-interface CLK is permitted up to 50 MHz. The
+default SPI speed remains 10 MHz.
 
 Timing options:
 
@@ -43,31 +39,30 @@ Command profiling sections:
     driver overhead
     total command time
 
-Examples:
+Sequence-construction optimization:
 
-    python3 adf5355_pi_sweep.py --verify
+    Frequency updates construct only the registers actually used by the
+    update sequence. The previous implementation constructed two complete
+    register maps for every update, even though most registers were not
+    transmitted during a frequency update.
 
-    python3 adf5355_pi_sweep.py \
-        --start-frequency 2000000000 \
-        --end-frequency 2100000000 \
-        --step-frequency 1000000 \
-        --step-time 0.010
+Corrected registers:
 
-    python3 adf5355_pi_sweep.py \
-        --start-frequency 2000000000 \
-        --end-frequency 2100000000 \
-        --step-frequency 1000000 \
-        --step-time 1e-9 \
-        --reference-hz 125000000 \
-        --channel-spacing-hz 100000 \
-        --chirp-time-verbose
+    Register 7  = 0x120000E7
+    Register 9  = 0x0302FCC9
+    Register 10 = calculated from fPFD
+    Register 12 = 0x0001041C
 
-    python3 adf5355_pi_sweep.py \
-        --start-frequency 2000000000 \
-        --end-frequency 2100000000 \
-        --step-frequency 1000000 \
-        --step-time 0.010 \
-        --max-speed-hz 50000000
+Register 4:
+
+    Charge-pump-current code = 9
+    Positive phase-detector polarity
+    MUXOUT logic level       = 3.3 V
+
+Register 6:
+
+    CP bleed-current code = 16
+    RFOUTB                = disabled
 """
 
 from __future__ import annotations
@@ -152,8 +147,6 @@ MIN_FRAC2 = 0
 MAX_FRAC2 = MAX_MOD2 - 1
 
 MIN_SPI_SPEED_HZ = 1
-
-# The ADF5355 datasheet permits serial-interface CLK up to 50 MHz.
 MAX_SPI_SPEED_HZ = 50_000_000
 DEFAULT_SPI_SPEED_HZ = 10_000_000
 
@@ -1060,11 +1053,127 @@ def make_initialization_sequence(
     ]
 
 
-def make_frequency_update_sequence(
+def make_frequency_update_sequence_optimized(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
 ) -> list[ProgrammingStep]:
+    """
+    Optimized frequency-update sequence construction.
+
+    Only R0, R1, R2, R4, and R10 are required by the update sequence.
+    The previous implementation constructed two complete register maps,
+    including registers that were never transmitted.
+    """
+    r10 = make_register_10(parameters)
+
+    r4_reset = make_register_4(
+        parameters,
+        counter_reset=True,
+    )
+
+    r4_normal = make_register_4(
+        parameters,
+        counter_reset=False,
+    )
+
+    r2 = make_register_2(parameters)
+    r1 = make_register_1(parameters)
+
+    r0_autocal_disabled = make_register_0(
+        parameters,
+        autocal_enabled=False,
+    )
+
+    r0_autocal_enabled = make_register_0(
+        parameters,
+        autocal_enabled=True,
+    )
+
+    if parameters.pfd_hz <= HIGH_PFD_THRESHOLD_HZ:
+        return [
+            ProgrammingStep(REG_R10, r10, "update R10"),
+            ProgrammingStep(
+                REG_R4,
+                r4_reset,
+                "update R4, reset enabled",
+            ),
+            ProgrammingStep(REG_R2, r2, "update R2"),
+            ProgrammingStep(REG_R1, r1, "update R1"),
+            ProgrammingStep(
+                REG_R0,
+                r0_autocal_disabled,
+                "AUTOCAL disabled",
+            ),
+            ProgrammingStep(
+                REG_R4,
+                r4_normal,
+                "reset disabled",
+                delay_after_ns=parameters.adc_clock.enforced_interval_ns,
+            ),
+            ProgrammingStep(
+                REG_R0,
+                r0_autocal_enabled,
+                "AUTOCAL enabled",
+            ),
+        ]
+
+    half_adc_clock = calculate_adc_clock(parameters.pfd_hz / 2)
+
+    return [
+        ProgrammingStep(REG_R10, r10, "half-PFD R10"),
+        ProgrammingStep(REG_R4, r4_reset, "half-PFD R4"),
+        ProgrammingStep(REG_R2, r2, "half-PFD R2"),
+        ProgrammingStep(REG_R1, r1, "half-PFD R1"),
+        ProgrammingStep(
+            REG_R0,
+            r0_autocal_disabled,
+            "half-PFD AUTOCAL off",
+        ),
+        ProgrammingStep(
+            REG_R4,
+            r4_normal,
+            "half-PFD reset disabled",
+            delay_after_ns=half_adc_clock.enforced_interval_ns,
+        ),
+        ProgrammingStep(
+            REG_R0,
+            r0_autocal_enabled,
+            "half-PFD AUTOCAL on",
+        ),
+        ProgrammingStep(REG_R10, r10, "final-PFD R10"),
+        ProgrammingStep(REG_R4, r4_reset, "final-PFD R4"),
+        ProgrammingStep(REG_R2, r2, "final-PFD R2"),
+        ProgrammingStep(REG_R1, r1, "final-PFD R1"),
+        ProgrammingStep(
+            REG_R0,
+            r0_autocal_disabled,
+            "final-PFD AUTOCAL off",
+        ),
+        ProgrammingStep(
+            REG_R4,
+            r4_normal,
+            "final-PFD reset disabled",
+            delay_after_ns=parameters.adc_clock.enforced_interval_ns,
+        ),
+        ProgrammingStep(
+            REG_R0,
+            r0_autocal_enabled,
+            "final-PFD AUTOCAL on",
+        ),
+    ]
+
+
+def make_frequency_update_sequence_reference(
+    parameters: SynthesizerParameters,
+    output_power_dbm: int,
+    enable_rfout_a: bool,
+) -> list[ProgrammingStep]:
+    """
+    Reference implementation used only by regression tests.
+
+    This intentionally recreates the previous full-register-map approach.
+    """
     reset = make_register_map(
         parameters,
         output_power_dbm,
@@ -1084,17 +1193,29 @@ def make_frequency_update_sequence(
     if parameters.pfd_hz <= HIGH_PFD_THRESHOLD_HZ:
         return [
             ProgrammingStep(REG_R10, reset[REG_R10], "update R10"),
-            ProgrammingStep(REG_R4, reset[REG_R4], "update R4, reset enabled"),
+            ProgrammingStep(
+                REG_R4,
+                reset[REG_R4],
+                "update R4, reset enabled",
+            ),
             ProgrammingStep(REG_R2, reset[REG_R2], "update R2"),
             ProgrammingStep(REG_R1, reset[REG_R1], "update R1"),
-            ProgrammingStep(REG_R0, reset[REG_R0], "AUTOCAL disabled"),
+            ProgrammingStep(
+                REG_R0,
+                reset[REG_R0],
+                "AUTOCAL disabled",
+            ),
             ProgrammingStep(
                 REG_R4,
                 normal[REG_R4],
                 "reset disabled",
                 delay_after_ns=parameters.adc_clock.enforced_interval_ns,
             ),
-            ProgrammingStep(REG_R0, normal[REG_R0], "AUTOCAL enabled"),
+            ProgrammingStep(
+                REG_R0,
+                normal[REG_R0],
+                "AUTOCAL enabled",
+            ),
         ]
 
     half_adc_clock = calculate_adc_clock(parameters.pfd_hz / 2)
@@ -1104,26 +1225,42 @@ def make_frequency_update_sequence(
         ProgrammingStep(REG_R4, reset[REG_R4], "half-PFD R4"),
         ProgrammingStep(REG_R2, reset[REG_R2], "half-PFD R2"),
         ProgrammingStep(REG_R1, reset[REG_R1], "half-PFD R1"),
-        ProgrammingStep(REG_R0, reset[REG_R0], "half-PFD AUTOCAL off"),
+        ProgrammingStep(
+            REG_R0,
+            reset[REG_R0],
+            "half-PFD AUTOCAL off",
+        ),
         ProgrammingStep(
             REG_R4,
             normal[REG_R4],
             "half-PFD reset disabled",
             delay_after_ns=half_adc_clock.enforced_interval_ns,
         ),
-        ProgrammingStep(REG_R0, normal[REG_R0], "half-PFD AUTOCAL on"),
+        ProgrammingStep(
+            REG_R0,
+            normal[REG_R0],
+            "half-PFD AUTOCAL on",
+        ),
         ProgrammingStep(REG_R10, reset[REG_R10], "final-PFD R10"),
         ProgrammingStep(REG_R4, reset[REG_R4], "final-PFD R4"),
         ProgrammingStep(REG_R2, reset[REG_R2], "final-PFD R2"),
         ProgrammingStep(REG_R1, reset[REG_R1], "final-PFD R1"),
-        ProgrammingStep(REG_R0, reset[REG_R0], "final-PFD AUTOCAL off"),
+        ProgrammingStep(
+            REG_R0,
+            reset[REG_R0],
+            "final-PFD AUTOCAL off",
+        ),
         ProgrammingStep(
             REG_R4,
             normal[REG_R4],
             "final-PFD reset disabled",
             delay_after_ns=parameters.adc_clock.enforced_interval_ns,
         ),
-        ProgrammingStep(REG_R0, normal[REG_R0], "final-PFD AUTOCAL on"),
+        ProgrammingStep(
+            REG_R0,
+            normal[REG_R0],
+            "final-PFD AUTOCAL on",
+        ),
     ]
 
 
@@ -1407,7 +1544,7 @@ class ADF5355:
 
         construction_start_ns = time.monotonic_ns()
 
-        steps = make_frequency_update_sequence(
+        steps = make_frequency_update_sequence_optimized(
             parameters,
             output_power_dbm,
             enable_rfout_a,
@@ -1774,21 +1911,20 @@ def report_direction_statistics(
         flush=True,
     )
 
-    command_samples = {
-        section: command_statistics.section_samples_ns[section]
-        for section in COMMAND_SECTIONS
-    }
+    total_command_samples = (
+        command_statistics.section_samples_ns[
+            "total command time"
+        ]
+    )
 
-    # Compute these before calculating component percentages.
-    total_command_samples = command_samples["total command time"]
-
-    command_total_mean_ns = (
+    # Compute denominators before calculating component percentages.
+    total_command_mean_ns = (
         mean(total_command_samples)
         if total_command_samples
         else 0.0
     )
 
-    command_total_median_ns = (
+    total_command_median_ns = (
         median(total_command_samples)
         if total_command_samples
         else 0.0
@@ -1798,7 +1934,7 @@ def report_direction_statistics(
     command_component_median_sum_ns = 0.0
 
     for section in COMMAND_SECTIONS:
-        samples = command_samples[section]
+        samples = command_statistics.section_samples_ns[section]
 
         section_mean_ns = mean(samples) if samples else 0.0
         section_median_ns = median(samples) if samples else 0.0
@@ -1808,8 +1944,8 @@ def report_direction_statistics(
             command_component_median_sum_ns += section_median_ns
 
         fraction = (
-            100.0 * section_mean_ns / command_total_mean_ns
-            if command_total_mean_ns > 0
+            100.0 * section_mean_ns / total_command_mean_ns
+            if total_command_mean_ns > 0
             else 0.0
         )
 
@@ -1824,11 +1960,11 @@ def report_direction_statistics(
     print(
         f"  command accounting residual: "
         f"mean={(
-            command_total_mean_ns
+            total_command_mean_ns
             - command_component_mean_sum_ns
         ) / 1000.0:.3f} usec; "
         f"median={(
-            command_total_median_ns
+            total_command_median_ns
             - command_component_median_sum_ns
         ) / 1000.0:.3f} usec",
         flush=True,
@@ -2167,6 +2303,76 @@ def parameter_signature(
     )
 
 
+def run_sequence_construction_regression_test() -> None:
+    """
+    Compare optimized and reference update sequences for:
+
+        - below/equal 75 MHz PFD;
+        - above 75 MHz PFD;
+        - both sweep directions;
+        - multiple frequencies.
+    """
+    cases = [
+        (
+            2_000_000_000,
+            125_000_000,
+            REFERENCE_MODE_SINGLE_ENDED,
+            100_000,
+        ),
+        (
+            2_100_000_000,
+            125_000_000,
+            REFERENCE_MODE_SINGLE_ENDED,
+            100_000,
+        ),
+        (
+            2_000_000_000,
+            200_000_000,
+            REFERENCE_MODE_DIFFERENTIAL,
+            100_000,
+        ),
+        (
+            2_100_000_000,
+            200_000_000,
+            REFERENCE_MODE_DIFFERENTIAL,
+            100_000,
+        ),
+    ]
+
+    for (
+        rf_frequency,
+        reference_frequency,
+        reference_mode,
+        channel_spacing,
+    ) in cases:
+        reference_configuration = build_reference_configuration(
+            reference_frequency,
+            reference_mode,
+        )
+
+        parameters = calculate_synthesizer_parameters(
+            rf_frequency,
+            reference_hz=reference_frequency,
+            reference_mode=reference_mode,
+            channel_spacing_hz=channel_spacing,
+            reference_configuration=reference_configuration,
+        )
+
+        optimized = make_frequency_update_sequence_optimized(
+            parameters,
+            output_power_dbm=5,
+            enable_rfout_a=True,
+        )
+
+        reference = make_frequency_update_sequence_reference(
+            parameters,
+            output_power_dbm=5,
+            enable_rfout_a=True,
+        )
+
+        assert optimized == reference
+
+
 def run_reuse_regression_test() -> None:
     reference_configuration = build_reference_configuration(
         125_000_000,
@@ -2208,7 +2414,6 @@ def run_reuse_regression_test() -> None:
         )
 
         assert reused_parameters is reusable_parameters
-
         assert (
             parameter_signature(fresh_parameters)
             == parameter_signature(reused_parameters)
@@ -2307,6 +2512,7 @@ def run_verification() -> None:
 
     assert differential_registers[REG_R4] == 0x3200A784
 
+    run_sequence_construction_regression_test()
     run_reuse_regression_test()
     run_command_profile_regression_test()
 
