@@ -36,8 +36,18 @@ Command profiling sections:
     sequence construction
     SPI transfer
     protocol waits
+    digital-lock wait
     driver overhead
     total command time
+
+Digital-lock measurement:
+
+    --measure-lock-time arms a GPIO25 rising-edge event before each
+    frequency update. It measures from completion of the final,
+    AUTOCAL-enabled Register 0 write to the MUXOUT digital-lock edge.
+    The wait is included as the "digital-lock wait" command component.
+    This mode waits for every update, so it measures lock-limited sweep
+    timing rather than an unrestricted chirp rate.
 
 Sequence-construction optimization:
 
@@ -70,6 +80,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -192,6 +203,7 @@ COMMAND_SECTIONS = (
     "sequence construction",
     "SPI transfer",
     "protocol waits",
+    "digital-lock wait",
     "driver overhead",
     "total command time",
 )
@@ -337,6 +349,7 @@ class CommandTimingStatistics:
         sequence_construction_ns: int,
         spi_transfer_ns: int,
         protocol_wait_ns: int,
+        digital_lock_wait_ns: int,
         driver_overhead_ns: int,
         total_ns: int,
     ) -> None:
@@ -351,6 +364,10 @@ class CommandTimingStatistics:
         self.section_samples_ns[
             "protocol waits"
         ].append(protocol_wait_ns)
+
+        self.section_samples_ns[
+            "digital-lock wait"
+        ].append(digital_lock_wait_ns)
 
         self.section_samples_ns[
             "driver overhead"
@@ -412,6 +429,7 @@ class ProgrammingStep:
     description: str
     adc_clock_for_following_r0: Optional[ADCClockConfiguration] = None
     delay_after_ns: int = 0
+    starts_lock_measurement: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,7 +438,10 @@ class CommandTimingSample:
     sequence_construction_ns: int
     spi_transfer_ns: int
     protocol_wait_ns: int
+    digital_lock_wait_ns: int
     driver_overhead_ns: int
+    lock_latency_ns: Optional[int]
+    lock_timed_out: bool
 
 
 # ============================================================================
@@ -1168,6 +1189,7 @@ def make_frequency_update_sequence_optimized(
                 REG_R0,
                 r0_autocal_enabled,
                 "AUTOCAL enabled",
+                starts_lock_measurement=True,
             ),
         ]
 
@@ -1213,6 +1235,7 @@ def make_frequency_update_sequence_optimized(
             REG_R0,
             r0_autocal_enabled,
             "final-PFD AUTOCAL on",
+            starts_lock_measurement=True,
         ),
     ]
 
@@ -1268,6 +1291,7 @@ def make_frequency_update_sequence_reference(
                 REG_R0,
                 normal[REG_R0],
                 "AUTOCAL enabled",
+                starts_lock_measurement=True,
             ),
         ]
 
@@ -1313,6 +1337,7 @@ def make_frequency_update_sequence_reference(
             REG_R0,
             normal[REG_R0],
             "final-PFD AUTOCAL on",
+            starts_lock_measurement=True,
         ),
     ]
 
@@ -1346,6 +1371,85 @@ def wait_for_digital_lock() -> None:
             time.sleep(0.001)
     finally:
         GPIO.cleanup(MUXOUT_GPIO_BCM)
+
+
+class DigitalLockMonitor:
+    """Measure final-R0-to-MUXOUT-digital-lock latency on GPIO25."""
+
+    def __init__(self) -> None:
+        if GPIO is None:
+            raise RuntimeError("digital-lock measurement requires RPi.GPIO")
+
+        self._edge_event = threading.Event()
+        self._guard = threading.Lock()
+        self._armed = False
+        self._edge_timestamp_ns: Optional[int] = None
+
+    def __enter__(self) -> "DigitalLockMonitor":
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(MUXOUT_GPIO_BCM, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+        GPIO.add_event_detect(
+            MUXOUT_GPIO_BCM,
+            GPIO.RISING,
+            callback=self._on_rising_edge,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        GPIO.remove_event_detect(MUXOUT_GPIO_BCM)
+        GPIO.cleanup(MUXOUT_GPIO_BCM)
+
+    def _on_rising_edge(self, channel: int) -> None:
+        del channel
+
+        with self._guard:
+            if not self._armed:
+                return
+
+            self._edge_timestamp_ns = time.monotonic_ns()
+            self._edge_event.set()
+
+    def arm(self) -> None:
+        """Discard older edges and arm the next MUXOUT rising edge."""
+        with self._guard:
+            self._edge_timestamp_ns = None
+            self._edge_event.clear()
+            self._armed = True
+
+    def wait_for_lock(
+        self,
+        final_r0_end_ns: int,
+        timeout_ns: int,
+    ) -> tuple[Optional[int], int]:
+        """Return (lock latency, elapsed wait); latency is None on timeout."""
+        deadline_ns = final_r0_end_ns + timeout_ns
+
+        while True:
+            with self._guard:
+                edge_timestamp_ns = self._edge_timestamp_ns
+
+            if edge_timestamp_ns is not None:
+                with self._guard:
+                    self._armed = False
+
+                if edge_timestamp_ns >= final_r0_end_ns:
+                    return (
+                        edge_timestamp_ns - final_r0_end_ns,
+                        time.monotonic_ns() - final_r0_end_ns,
+                    )
+
+                # An edge from before final R0 cannot represent this update.
+                self.arm()
+
+            remaining_ns = deadline_ns - time.monotonic_ns()
+
+            if remaining_ns <= 0:
+                with self._guard:
+                    self._armed = False
+
+                return None, timeout_ns
+
+            self._edge_event.wait(remaining_ns / NS_PER_SECOND)
 
 
 # ============================================================================
@@ -1443,6 +1547,8 @@ class ADF5355:
         sequence_name: str,
         command_start_ns: Optional[int] = None,
         sequence_construction_ns: int = 0,
+        lock_monitor: Optional[DigitalLockMonitor] = None,
+        lock_timeout_ns: int = 0,
     ) -> CommandTimingSample:
         step_list = list(steps)
 
@@ -1455,6 +1561,12 @@ class ADF5355:
 
         spi_transfer_ns = 0
         protocol_wait_ns = 0
+        digital_lock_wait_ns = 0
+        lock_latency_ns: Optional[int] = None
+        lock_timed_out = False
+
+        if lock_monitor is not None:
+            lock_monitor.arm()
 
         if self.verbose:
             print(
@@ -1503,6 +1615,15 @@ class ADF5355:
                     - wait_start_ns
                 )
 
+            if step.starts_lock_measurement and lock_monitor is not None:
+                lock_latency_ns, digital_lock_wait_ns = (
+                    lock_monitor.wait_for_lock(
+                        end_ns,
+                        lock_timeout_ns,
+                    )
+                )
+                lock_timed_out = lock_latency_ns is None
+
             if self.verbose:
                 start_us = (
                     start_ns - command_start_ns
@@ -1548,7 +1669,8 @@ class ADF5355:
             total_ns
             - sequence_construction_ns
             - spi_transfer_ns
-            - protocol_wait_ns,
+            - protocol_wait_ns
+            - digital_lock_wait_ns,
         )
 
         return CommandTimingSample(
@@ -1556,7 +1678,10 @@ class ADF5355:
             sequence_construction_ns=sequence_construction_ns,
             spi_transfer_ns=spi_transfer_ns,
             protocol_wait_ns=protocol_wait_ns,
+            digital_lock_wait_ns=digital_lock_wait_ns,
             driver_overhead_ns=driver_overhead_ns,
+            lock_latency_ns=lock_latency_ns,
+            lock_timed_out=lock_timed_out,
         )
 
     def program_initial_frequency(
@@ -1591,6 +1716,8 @@ class ADF5355:
         output_power_dbm: int,
         enable_rfout_a: bool,
         command_start_ns: Optional[int] = None,
+        lock_monitor: Optional[DigitalLockMonitor] = None,
+        lock_timeout_ns: int = 0,
     ) -> CommandTimingSample:
         if command_start_ns is None:
             command_start_ns = time.monotonic_ns()
@@ -1620,6 +1747,8 @@ class ADF5355:
             name,
             command_start_ns=command_start_ns,
             sequence_construction_ns=construction_duration_ns,
+            lock_monitor=lock_monitor,
+            lock_timeout_ns=lock_timeout_ns,
         )
 
     def close(self) -> None:
@@ -2024,6 +2153,33 @@ def report_direction_statistics(
     )
 
 
+def report_lock_measurement_statistics(
+    lock_latencies_ns: list[int],
+    lock_timeouts: int,
+) -> None:
+    """Print final-R0-to-digital-lock measurements for one direction."""
+    print("  final R0 to digital-lock:", flush=True)
+
+    if lock_latencies_ns:
+        ordered = sorted(lock_latencies_ns)
+        p95_index = min(
+            len(ordered) - 1,
+            math.ceil(len(ordered) * 0.95) - 1,
+        )
+        print(
+            f"    samples={len(lock_latencies_ns)}; "
+            f"min={ordered[0] / 1000.0:.3f} usec; "
+            f"median={median(ordered) / 1000.0:.3f} usec; "
+            f"mean={mean(ordered) / 1000.0:.3f} usec; "
+            f"p95={ordered[p95_index] / 1000.0:.3f} usec; "
+            f"max={ordered[-1] / 1000.0:.3f} usec",
+            flush=True,
+        )
+
+    if lock_timeouts:
+        print(f"    timeouts={lock_timeouts}", flush=True)
+
+
 # ============================================================================
 # Sweep execution
 # ============================================================================
@@ -2034,6 +2190,7 @@ def run_sweep(
     output_power_dbm: int,
     enable_rfout_a: bool,
     script_start_ns: int,
+    lock_monitor: Optional[DigitalLockMonitor] = None,
 ) -> None:
     validate_sweep_arguments(
         args.start_frequency,
@@ -2057,6 +2214,11 @@ def run_sweep(
             raise RuntimeError(
                 "--wait-for-lock requires RPi.GPIO"
             )
+
+    if args.measure_lock_time and lock_monitor is None:
+        raise RuntimeError(
+            "--measure-lock-time requires a digital-lock monitor"
+        )
 
     reference_configuration = build_reference_configuration(
         args.reference_hz,
@@ -2113,6 +2275,8 @@ def run_sweep(
     preparation_durations_ns: list[int] = []
     loop_overhead_durations_ns: list[int] = []
     command_durations_ns: list[int] = []
+    lock_latencies_ns: list[int] = []
+    lock_timeouts = 0
 
     preparation_statistics = (
         ParameterPreparationStatistics()
@@ -2198,6 +2362,10 @@ def run_sweep(
             output_power_dbm,
             enable_rfout_a,
             command_start_ns=command_start_ns,
+            lock_monitor=lock_monitor,
+            lock_timeout_ns=int(
+                round(args.lock_timeout_ms * 1_000_000)
+            ),
         )
 
         command_end_ns = time.monotonic_ns()
@@ -2211,9 +2379,20 @@ def run_sweep(
             ),
             spi_transfer_ns=command_timing.spi_transfer_ns,
             protocol_wait_ns=command_timing.protocol_wait_ns,
+            digital_lock_wait_ns=(
+                command_timing.digital_lock_wait_ns
+            ),
             driver_overhead_ns=command_timing.driver_overhead_ns,
             total_ns=command_timing.total_ns,
         )
+
+        if args.measure_lock_time:
+            if command_timing.lock_latency_ns is None:
+                lock_timeouts += 1
+            else:
+                lock_latencies_ns.append(
+                    command_timing.lock_latency_ns
+                )
 
         total_steps += 1
 
@@ -2235,6 +2414,20 @@ def run_sweep(
                 flush=True,
             )
 
+        if args.lock_time_verbose:
+            if command_timing.lock_latency_ns is None:
+                print(
+                    "Final R0 to digital-lock: "
+                    f"timeout after {args.lock_timeout_ms:.3f} ms",
+                    flush=True,
+                )
+            else:
+                print(
+                    "Final R0 to digital-lock: "
+                    f"{command_timing.lock_latency_ns / 1000.0:.3f} usec",
+                    flush=True,
+                )
+
         if (
             frequency == args.end_frequency
             and direction == "start-to-end"
@@ -2255,6 +2448,12 @@ def run_sweep(
                     command_statistics=command_statistics,
                 )
 
+                if args.measure_lock_time:
+                    report_lock_measurement_statistics(
+                        lock_latencies_ns,
+                        lock_timeouts,
+                    )
+
             direction = "end-to-start"
             direction_start_ns = command_end_ns
             total_steps = 0
@@ -2263,6 +2462,8 @@ def run_sweep(
             preparation_durations_ns.clear()
             loop_overhead_durations_ns.clear()
             command_durations_ns.clear()
+            lock_latencies_ns.clear()
+            lock_timeouts = 0
             preparation_statistics = (
                 ParameterPreparationStatistics()
             )
@@ -2288,6 +2489,12 @@ def run_sweep(
                     command_statistics=command_statistics,
                 )
 
+                if args.measure_lock_time:
+                    report_lock_measurement_statistics(
+                        lock_latencies_ns,
+                        lock_timeouts,
+                    )
+
             direction = "start-to-end"
             direction_start_ns = command_end_ns
             total_steps = 0
@@ -2296,6 +2503,8 @@ def run_sweep(
             preparation_durations_ns.clear()
             loop_overhead_durations_ns.clear()
             command_durations_ns.clear()
+            lock_latencies_ns.clear()
+            lock_timeouts = 0
             preparation_statistics = (
                 ParameterPreparationStatistics()
             )
@@ -2326,6 +2535,96 @@ class FakeSPI:
 
     def close(self) -> None:
         pass
+
+
+class FakeGPIO:
+    BCM = object()
+    IN = object()
+    PUD_OFF = object()
+    RISING = object()
+
+    def __init__(self) -> None:
+        self.callback = None
+
+    def setmode(self, mode: object) -> None:
+        del mode
+
+    def setup(
+        self,
+        channel: int,
+        mode: object,
+        pull_up_down: object,
+    ) -> None:
+        del channel, mode, pull_up_down
+
+    def add_event_detect(
+        self,
+        channel: int,
+        edge: object,
+        callback,
+    ) -> None:
+        del channel, edge
+        self.callback = callback
+
+    def remove_event_detect(self, channel: int) -> None:
+        del channel
+        self.callback = None
+
+    def cleanup(self, channel: int) -> None:
+        del channel
+
+
+class LockEdgeFakeSPI(FakeSPI):
+    def __init__(self, gpio: FakeGPIO) -> None:
+        super().__init__()
+        self.gpio = gpio
+
+    def xfer2(self, data) -> None:
+        super().xfer2(data)
+
+        if self.gpio.callback is not None:
+            threading.Timer(
+                0.001,
+                self.gpio.callback,
+                args=(MUXOUT_GPIO_BCM,),
+            ).start()
+
+
+def run_digital_lock_measurement_regression_test() -> None:
+    global GPIO
+
+    original_gpio = GPIO
+    fake_gpio = FakeGPIO()
+    GPIO = fake_gpio
+
+    try:
+        fake_spi = LockEdgeFakeSPI(fake_gpio)
+
+        with DigitalLockMonitor() as lock_monitor:
+            device = ADF5355(spi=fake_spi)
+
+            try:
+                timing = device.write_sequence(
+                    [
+                        ProgrammingStep(
+                            REG_R0,
+                            REG_R0,
+                            "test final R0",
+                            starts_lock_measurement=True,
+                        )
+                    ],
+                    "digital-lock regression test",
+                    lock_monitor=lock_monitor,
+                    lock_timeout_ns=10_000_000,
+                )
+            finally:
+                device.close()
+
+        assert timing.lock_latency_ns is not None
+        assert not timing.lock_timed_out
+        assert timing.digital_lock_wait_ns > 0
+    finally:
+        GPIO = original_gpio
 
 
 def parameter_signature(
@@ -2517,12 +2816,16 @@ def run_command_profile_regression_test() -> None:
     assert timing.sequence_construction_ns >= 0
     assert timing.spi_transfer_ns >= 0
     assert timing.protocol_wait_ns >= 0
+    assert timing.digital_lock_wait_ns == 0
+    assert timing.lock_latency_ns is None
+    assert not timing.lock_timed_out
     assert timing.driver_overhead_ns >= 0
 
     accounted_ns = (
         timing.sequence_construction_ns
         + timing.spi_transfer_ns
         + timing.protocol_wait_ns
+        + timing.digital_lock_wait_ns
         + timing.driver_overhead_ns
     )
 
@@ -2578,6 +2881,7 @@ def run_verification() -> None:
     run_sequence_construction_regression_test()
     run_reuse_regression_test()
     run_command_profile_regression_test()
+    run_digital_lock_measurement_regression_test()
 
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
@@ -2781,6 +3085,28 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--measure-lock-time",
+        action="store_true",
+        help=(
+            "measure final R0 to GPIO25 digital-lock rising-edge "
+            "latency for every frequency update"
+        ),
+    )
+
+    parser.add_argument(
+        "--lock-timeout-ms",
+        type=positive_float,
+        default=20.0,
+        help="digital-lock measurement timeout in milliseconds",
+    )
+
+    parser.add_argument(
+        "--lock-time-verbose",
+        action="store_true",
+        help="print final-R0-to-digital-lock latency for every update",
+    )
+
+    parser.add_argument(
         "--check-muxout",
         action="store_true",
         help="read MUXOUT on GPIO25 after initial programming",
@@ -2864,6 +3190,25 @@ def main() -> None:
 
         print(MUXOUT_WARNING, file=sys.stderr)
 
+    if args.measure_lock_time:
+        if args.wait_for_lock:
+            parser.error(
+                "--measure-lock-time cannot be combined with "
+                "--wait-for-lock"
+            )
+
+        if args.muxout_lock_detect != MUXOUT_DIGITAL_LOCK_DETECT:
+            parser.error(
+                "--measure-lock-time requires digital MUXOUT"
+            )
+
+        print(MUXOUT_WARNING, file=sys.stderr)
+
+    if args.lock_time_verbose and not args.measure_lock_time:
+        parser.error(
+            "--lock-time-verbose requires --measure-lock-time"
+        )
+
     if args.check_muxout:
         print(MUXOUT_WARNING, file=sys.stderr)
 
@@ -2917,13 +3262,24 @@ def main() -> None:
             max_speed_hz=args.max_speed_hz,
             verbose=args.verbose,
         ) as device:
-            run_sweep(
-                device,
-                args,
-                output_power_dbm,
-                enable_rfout_a,
-                script_start_ns,
-            )
+            if args.measure_lock_time:
+                with DigitalLockMonitor() as lock_monitor:
+                    run_sweep(
+                        device,
+                        args,
+                        output_power_dbm,
+                        enable_rfout_a,
+                        script_start_ns,
+                        lock_monitor,
+                    )
+            else:
+                run_sweep(
+                    device,
+                    args,
+                    output_power_dbm,
+                    enable_rfout_a,
+                    script_start_ns,
+                )
 
     except KeyboardInterrupt:
         print("\nSweep stopped by user.", file=sys.stderr)
