@@ -32,7 +32,7 @@ RFOUTB is prohibited. Only RFOUTA may be enabled.
 Corrected fixed registers:
 
     Register 7  = 0x120000E7
-    Register 9  = 0x0302FCC9
+    Register 9  = calculated from fPFD for calibration timing
     Register 10 = calculated from fPFD
     Register 12 = 0x0001041C
 
@@ -159,7 +159,16 @@ TIMING_MARGIN_NS = 10_000
 
 # Correct fixed register values.
 REGISTER_7_VALUE = 0x120000E7
-REGISTER_9_VALUE = 0x0302FCC9
+
+# Register 9 timing fields. These must be calculated from fPFD; a fixed
+# Register 9 value is not valid when the reference configuration changes.
+VCO_BAND_DIVIDER_MAX = 255
+TIMEOUT_MAX = 1023
+ALC_WAIT = 30
+SYNTHESIZER_LOCK_TIMEOUT = 12
+MIN_SYNTHESIZER_LOCK_SETTLING_NS = 20_000
+MIN_ALC_SETTLING_NS = 50_000
+NS_PER_SECOND = 1_000_000_000
 
 # Figure 53 Register 12 values.
 PHASE_RESYNC_CLOCK_DIVIDER = 1
@@ -714,9 +723,49 @@ def make_register_6(
     return value
 
 
-def make_register_9() -> int:
-    """Return Register 9 = 0x0302FCC9."""
-    return REGISTER_9_VALUE
+def make_register_9(parameters: SynthesizerParameters) -> int:
+    """Build Register 9 with datasheet-compliant calibration timing."""
+    pfd_hz = parameters.pfd_hz
+
+    vco_band_divider = ceil_fraction(pfd_hz / 2_400_000)
+
+    # Register 9 requires at least 20 us for VTUNE/DAC settling. The
+    # ALC wait requirement is strict: it must be greater than 50 us.
+    minimum_timeout_for_synth_lock = ceil_fraction(
+        pfd_hz
+        * Fraction(
+            MIN_SYNTHESIZER_LOCK_SETTLING_NS,
+            NS_PER_SECOND * SYNTHESIZER_LOCK_TIMEOUT,
+        )
+    )
+    alc_timeout_threshold = (
+        pfd_hz
+        * Fraction(MIN_ALC_SETTLING_NS, NS_PER_SECOND)
+        / ALC_WAIT
+    )
+    minimum_timeout_for_alc = (
+        alc_timeout_threshold.numerator
+        // alc_timeout_threshold.denominator
+        + 1
+    )
+    timeout = max(
+        minimum_timeout_for_synth_lock,
+        minimum_timeout_for_alc,
+    )
+
+    if not 1 <= vco_band_divider <= VCO_BAND_DIVIDER_MAX:
+        raise ValueError("VCO band divider is outside the valid range")
+
+    if not 1 <= timeout <= TIMEOUT_MAX:
+        raise ValueError("Register 9 timeout is outside the valid range")
+
+    return (
+        (vco_band_divider << 24)
+        | (timeout << 14)
+        | (ALC_WAIT << 9)
+        | (SYNTHESIZER_LOCK_TIMEOUT << 4)
+        | REG_R9
+    )
 
 
 def make_register_10(parameters: SynthesizerParameters) -> int:
@@ -768,7 +817,7 @@ def make_register_map(
         ),
         REG_R7: REGISTER_7_VALUE,
         REG_R8: 0x102D0428,
-        REG_R9: make_register_9(),
+        REG_R9: make_register_9(parameters),
         REG_R10: make_register_10(parameters),
         REG_R11: 0x0061300B,
         REG_R12: make_register_12(),
@@ -904,6 +953,33 @@ def read_muxout_gpio() -> int:
 
     try:
         return int(GPIO.input(MUXOUT_GPIO_BCM))
+    finally:
+        GPIO.cleanup(MUXOUT_GPIO_BCM)
+
+
+def wait_for_digital_lock(timeout_s: float) -> None:
+    """Wait for active-high digital MUXOUT lock detection on GPIO25."""
+    if GPIO is None:
+        raise RuntimeError("--wait-for-lock requires RPi.GPIO")
+
+    deadline_ns = time.monotonic_ns() + int(
+        timeout_s * NS_PER_SECOND
+    )
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(MUXOUT_GPIO_BCM, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+
+    try:
+        while not GPIO.input(MUXOUT_GPIO_BCM):
+            remaining_ns = deadline_ns - time.monotonic_ns()
+
+            if remaining_ns <= 0:
+                raise TimeoutError(
+                    "digital lock did not assert within "
+                    f"{timeout_s * 1000.0:.3f} ms"
+                )
+
+            time.sleep(min(0.001, remaining_ns / NS_PER_SECOND))
     finally:
         GPIO.cleanup(MUXOUT_GPIO_BCM)
 
@@ -1123,9 +1199,18 @@ def run_verification() -> None:
     )
 
     assert registers[REG_R7] == 0x120000E7
-    assert registers[REG_R9] == 0x0302FCC9
+    assert registers[REG_R9] == 0x1B1A7CC9
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
+
+    high_pfd_parameters = calculate_synthesizer_parameters(
+        2_400_000_000,
+        reference_hz=250_000_000,
+        reference_mode=REFERENCE_MODE_DIFFERENTIAL,
+    )
+
+    assert high_pfd_parameters.pfd_hz == 125_000_000
+    assert make_register_9(high_pfd_parameters) == 0x35347CC9
 
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
@@ -1295,6 +1380,22 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--wait-for-lock",
+        action="store_true",
+        help=(
+            "wait for active-high digital MUXOUT lock detection on "
+            "GPIO25 before exiting"
+        ),
+    )
+
+    parser.add_argument(
+        "--lock-timeout-ms",
+        type=positive_float,
+        default=20.0,
+        help="maximum wait for digital lock in milliseconds",
+    )
+
+    parser.add_argument(
         "--check-muxout",
         action="store_true",
         help="read MUXOUT on GPIO25 after programming",
@@ -1358,6 +1459,17 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    if args.wait_for_lock:
+        if args.muxout_lock_detect != MUXOUT_DIGITAL_LOCK_DETECT:
+            parser.error(
+                "--wait-for-lock requires digital MUXOUT"
+            )
+
+        print(
+            MUXOUT_WARNING,
+            file=sys.stderr,
+        )
+
     if args.rf_output_hz is None:
         parser.error(
             "--rf-output-hz is required unless --verify is used"
@@ -1399,6 +1511,11 @@ def main() -> None:
                 time.sleep(0.1)
                 muxout_state = read_muxout_gpio()
 
+            if args.wait_for_lock:
+                wait_for_digital_lock(
+                    args.lock_timeout_ms / 1000.0
+                )
+
     except (TypeError, ValueError, RuntimeError) as exc:
         parser.error(str(exc))
 
@@ -1419,7 +1536,10 @@ def main() -> None:
     print(f"MUXOUT function: {parameters.muxout_lock_detect}")
     print("MUXOUT logic level: 3.3 V")
     print(f"Register 7: 0x{REGISTER_7_VALUE:08X}")
-    print(f"Register 9: 0x{make_register_9():08X}")
+    print(
+        f"Register 9: "
+        f"0x{make_register_9(parameters):08X}"
+    )
     print(
         f"Register 10: "
         f"0x{make_register_10(parameters):08X}"
@@ -1434,6 +1554,9 @@ def main() -> None:
             f"MUXOUT state: "
             f"{'HIGH' if muxout_state else 'LOW'}"
         )
+
+    if args.wait_for_lock:
+        print("Digital lock: asserted")
 
 
 if __name__ == "__main__":
