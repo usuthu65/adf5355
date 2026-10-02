@@ -6,6 +6,13 @@ Continuous ADF5355 frequency sweep driver for Raspberry Pi SPI0.
 
 There is no --sweep option and no --rf-output-hz option.
 
+The ADF5355 serial-interface CLK is permitted up to 50 MHz by the
+device datasheet. This script therefore permits:
+
+    --max-speed-hz <= 50_000_000
+
+The default remains 10 MHz.
+
 Timing options:
 
     --freq-step-verbose
@@ -15,24 +22,7 @@ Timing options:
 
     --chirp-time-verbose
 
-        Print separate one-way start-to-end and end-to-start timing,
-        including:
-
-            elapsed time
-            total steps
-            small overrun events
-            large overrun events
-            mean/median total parameter-preparation time
-            mean/median preparation-section time
-            mean/median loop-overhead time
-            mean/median command time
-            mean/median active-step time
-
-Active-step time is:
-
-    parameter preparation
-    + loop overhead
-    + command execution
+        Print one-way timing and detailed preparation/command statistics.
 
 Preparation profiling sections:
 
@@ -43,38 +33,41 @@ Preparation profiling sections:
     MOD2/FRAC2 arithmetic
     final validation
     ADC-clock calculation
-    object construction
+    parameter-object update
 
-Optimization changes:
+Command profiling sections:
 
-    1. Reference configuration and ADC-clock configuration are computed
-       once before the sweep and reused.
+    sequence construction
+    SPI transfer
+    protocol waits
+    driver overhead
+    total command time
 
-    2. N-divider Fraction arithmetic is replaced with equivalent integer
-       arithmetic using the numerator and denominator of fPFD.
+Examples:
 
-    3. Synthesizer and configuration data classes use slots.
+    python3 adf5355_pi_sweep.py --verify
 
-    4. The profiling object is explicitly passed into the directional
-       report function.
+    python3 adf5355_pi_sweep.py \
+        --start-frequency 2000000000 \
+        --end-frequency 2100000000 \
+        --step-frequency 1000000 \
+        --step-time 0.010
 
-Corrected registers:
+    python3 adf5355_pi_sweep.py \
+        --start-frequency 2000000000 \
+        --end-frequency 2100000000 \
+        --step-frequency 1000000 \
+        --step-time 1e-9 \
+        --reference-hz 125000000 \
+        --channel-spacing-hz 100000 \
+        --chirp-time-verbose
 
-    Register 7  = 0x120000E7
-    Register 9  = 0x0302FCC9
-    Register 10 = calculated from fPFD
-    Register 12 = 0x0001041C
-
-Register 4:
-
-    Charge-pump-current code = 9
-    Positive phase-detector polarity
-    MUXOUT logic level       = 3.3 V
-
-Register 6:
-
-    CP bleed-current code = 16
-    RFOUTB                = disabled
+    python3 adf5355_pi_sweep.py \
+        --start-frequency 2000000000 \
+        --end-frequency 2100000000 \
+        --step-frequency 1000000 \
+        --step-time 0.010 \
+        --max-speed-hz 50000000
 """
 
 from __future__ import annotations
@@ -159,7 +152,10 @@ MIN_FRAC2 = 0
 MAX_FRAC2 = MAX_MOD2 - 1
 
 MIN_SPI_SPEED_HZ = 1
-MAX_SPI_SPEED_HZ = 19_999_999
+
+# The ADF5355 datasheet permits serial-interface CLK up to 50 MHz.
+MAX_SPI_SPEED_HZ = 50_000_000
+DEFAULT_SPI_SPEED_HZ = 10_000_000
 
 ADC_TARGET_HZ = 100_000
 ADC_CLK_DIV_MIN = 1
@@ -186,7 +182,15 @@ PROFILE_SECTIONS = (
     "MOD2/FRAC2 arithmetic",
     "final validation",
     "ADC-clock calculation",
-    "object construction",
+    "parameter-object update",
+)
+
+COMMAND_SECTIONS = (
+    "sequence construction",
+    "SPI transfer",
+    "protocol waits",
+    "driver overhead",
+    "total command time",
 )
 
 
@@ -297,15 +301,12 @@ MUXOUT is configured for 3.3 V logic. Do not apply 5 V to GPIO25.
 
 @dataclass
 class ParameterPreparationStatistics:
-    """Per-direction preparation profiling data."""
-
     section_samples_ns: dict[str, list[int]] = field(
         default_factory=lambda: {
             section: []
             for section in PROFILE_SECTIONS
         }
     )
-
     total_samples_ns: list[int] = field(default_factory=list)
 
     def record_section(
@@ -317,6 +318,44 @@ class ParameterPreparationStatistics:
 
     def record_total(self, duration_ns: int) -> None:
         self.total_samples_ns.append(duration_ns)
+
+
+@dataclass
+class CommandTimingStatistics:
+    section_samples_ns: dict[str, list[int]] = field(
+        default_factory=lambda: {
+            section: []
+            for section in COMMAND_SECTIONS
+        }
+    )
+
+    def record(
+        self,
+        sequence_construction_ns: int,
+        spi_transfer_ns: int,
+        protocol_wait_ns: int,
+        driver_overhead_ns: int,
+        total_ns: int,
+    ) -> None:
+        self.section_samples_ns[
+            "sequence construction"
+        ].append(sequence_construction_ns)
+
+        self.section_samples_ns[
+            "SPI transfer"
+        ].append(spi_transfer_ns)
+
+        self.section_samples_ns[
+            "protocol waits"
+        ].append(protocol_wait_ns)
+
+        self.section_samples_ns[
+            "driver overhead"
+        ].append(driver_overhead_ns)
+
+        self.section_samples_ns[
+            "total command time"
+        ].append(total_ns)
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,7 +377,7 @@ class ReferenceConfiguration:
     adc_clock: ADCClockConfiguration
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class SynthesizerParameters:
     rf_out_hz: int
     reference_hz: int
@@ -372,6 +411,15 @@ class ProgrammingStep:
     delay_after_ns: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CommandTimingSample:
+    total_ns: int
+    sequence_construction_ns: int
+    spi_transfer_ns: int
+    protocol_wait_ns: int
+    driver_overhead_ns: int
+
+
 # ============================================================================
 # Utility functions
 # ============================================================================
@@ -383,10 +431,6 @@ def ceil_fraction(value: Fraction) -> int:
     return (
         value.numerator + value.denominator - 1
     ) // value.denominator
-
-
-def fraction_to_float(value: Fraction) -> float:
-    return value.numerator / value.denominator
 
 
 def validate_reference_mode(reference_mode: str) -> None:
@@ -471,7 +515,7 @@ RFOUTB is disabled by this driver. Only RFOUTA is used.
 
 
 # ============================================================================
-# ADC and reference calculations
+# ADC/reference calculations
 # ============================================================================
 
 def calculate_adc_clock(
@@ -566,6 +610,10 @@ def select_rf_divider(rf_out_hz: int) -> int:
     raise ValueError("RFOUTA frequency cannot be generated")
 
 
+# ============================================================================
+# Exact integer parameter calculation
+# ============================================================================
+
 def calculate_synthesizer_parameters(
     rf_out_hz: int,
     reference_hz: int = DEFAULT_REFERENCE_HZ,
@@ -576,11 +624,11 @@ def calculate_synthesizer_parameters(
     reference_configuration: Optional[
         ReferenceConfiguration
     ] = None,
+    parameters_out: Optional[SynthesizerParameters] = None,
     preparation_statistics: Optional[
         ParameterPreparationStatistics
     ] = None,
 ) -> SynthesizerParameters:
-    """Calculate parameters using cached reference data when supplied."""
     profile_start_ns = (
         time.perf_counter_ns()
         if preparation_statistics is not None
@@ -603,21 +651,17 @@ def calculate_synthesizer_parameters(
         raise ValueError("Channel spacing must be positive")
 
     if reference_configuration is None:
-        validate_reference_mode(reference_mode)
-
         reference_configuration = build_reference_configuration(
             reference_hz,
             reference_mode,
         )
-
-    else:
-        if (
-            reference_configuration.reference_hz != reference_hz
-            or reference_configuration.reference_mode != reference_mode
-        ):
-            raise ValueError(
-                "Cached reference configuration does not match inputs"
-            )
+    elif (
+        reference_configuration.reference_hz != reference_hz
+        or reference_configuration.reference_mode != reference_mode
+    ):
+        raise ValueError(
+            "Cached reference configuration does not match inputs"
+        )
 
     if preparation_statistics is not None:
         preparation_statistics.record_section(
@@ -631,9 +675,6 @@ def calculate_synthesizer_parameters(
         else None
     )
 
-    # The reference configuration and ADC clock are cached. This section
-    # now measures the cached configuration access rather than recomputing
-    # the reference plan on every frequency step.
     reference_divider = reference_configuration.reference_divider
     reference_divide_by_2 = (
         reference_configuration.reference_divide_by_2
@@ -668,10 +709,8 @@ def calculate_synthesizer_parameters(
         else None
     )
 
-    # Equivalent integer arithmetic replaces repeated Fraction operations.
     pfd_numerator = pfd_hz.numerator
     pfd_denominator = pfd_hz.denominator
-
     vco_numerator = vco_hz * pfd_denominator
 
     int_value, remainder_numerator = divmod(
@@ -753,7 +792,6 @@ def calculate_synthesizer_parameters(
         else None
     )
 
-    # Cached ADC-clock configuration is reused.
     if preparation_statistics is not None:
         preparation_statistics.record_section(
             "ADC-clock calculation",
@@ -766,29 +804,49 @@ def calculate_synthesizer_parameters(
         else None
     )
 
-    parameters = SynthesizerParameters(
-        rf_out_hz=rf_out_hz,
-        reference_hz=reference_hz,
-        reference_mode=reference_mode,
-        channel_spacing_hz=channel_spacing_hz,
-        muxout_lock_detect=muxout_lock_detect,
-        mute_till_lock=mute_till_lock,
-        rf_divider=rf_divider,
-        vco_hz=vco_hz,
-        pfd_hz=pfd_hz,
-        reference_divider=reference_divider,
-        reference_divide_by_2=reference_divide_by_2,
-        int_value=int_value,
-        frac1=frac1,
-        mod1=MOD1,
-        frac2=frac2,
-        mod2=mod2,
-        adc_clock=adc_clock,
-    )
+    if parameters_out is None:
+        parameters = SynthesizerParameters(
+            rf_out_hz=rf_out_hz,
+            reference_hz=reference_hz,
+            reference_mode=reference_mode,
+            channel_spacing_hz=channel_spacing_hz,
+            muxout_lock_detect=muxout_lock_detect,
+            mute_till_lock=mute_till_lock,
+            rf_divider=rf_divider,
+            vco_hz=vco_hz,
+            pfd_hz=pfd_hz,
+            reference_divider=reference_divider,
+            reference_divide_by_2=reference_divide_by_2,
+            int_value=int_value,
+            frac1=frac1,
+            mod1=MOD1,
+            frac2=frac2,
+            mod2=mod2,
+            adc_clock=adc_clock,
+        )
+    else:
+        parameters_out.rf_out_hz = rf_out_hz
+        parameters_out.reference_hz = reference_hz
+        parameters_out.reference_mode = reference_mode
+        parameters_out.channel_spacing_hz = channel_spacing_hz
+        parameters_out.muxout_lock_detect = muxout_lock_detect
+        parameters_out.mute_till_lock = mute_till_lock
+        parameters_out.rf_divider = rf_divider
+        parameters_out.vco_hz = vco_hz
+        parameters_out.pfd_hz = pfd_hz
+        parameters_out.reference_divider = reference_divider
+        parameters_out.reference_divide_by_2 = reference_divide_by_2
+        parameters_out.int_value = int_value
+        parameters_out.frac1 = frac1
+        parameters_out.mod1 = MOD1
+        parameters_out.frac2 = frac2
+        parameters_out.mod2 = mod2
+        parameters_out.adc_clock = adc_clock
+        parameters = parameters_out
 
     if preparation_statistics is not None:
         preparation_statistics.record_section(
-            "object construction",
+            "parameter-object update",
             time.perf_counter_ns() - section_start_ns,
         )
 
@@ -1115,7 +1173,7 @@ class ADF5355:
         self,
         bus: int = SPI_BUS,
         device: int = SPI_DEVICE,
-        max_speed_hz: int = 10_000_000,
+        max_speed_hz: int = DEFAULT_SPI_SPEED_HZ,
         spi=None,
         verbose: bool = False,
     ) -> None:
@@ -1126,7 +1184,10 @@ class ADF5355:
             raise ValueError("This driver only allows SPI0 CE0")
 
         if not MIN_SPI_SPEED_HZ <= max_speed_hz <= MAX_SPI_SPEED_HZ:
-            raise ValueError("SPI speed is outside the allowed range")
+            raise ValueError(
+                f"SPI speed must be between "
+                f"{MIN_SPI_SPEED_HZ} and {MAX_SPI_SPEED_HZ} Hz"
+            )
 
         self.verbose = verbose
 
@@ -1190,13 +1251,20 @@ class ADF5355:
         self,
         steps: Iterable[ProgrammingStep],
         sequence_name: str,
-    ) -> None:
+        command_start_ns: Optional[int] = None,
+        sequence_construction_ns: int = 0,
+    ) -> CommandTimingSample:
         step_list = list(steps)
-        sequence_start_ns = time.monotonic_ns()
+
+        if command_start_ns is None:
+            command_start_ns = time.monotonic_ns()
 
         previous_end_ns: Optional[int] = None
         pending_r1_end_ns: Optional[int] = None
         pending_adc_clock: Optional[ADCClockConfiguration] = None
+
+        spi_transfer_ns = 0
+        protocol_wait_ns = 0
 
         if self.verbose:
             print(
@@ -1213,24 +1281,50 @@ class ADF5355:
                 and pending_r1_end_ns is not None
                 and pending_adc_clock is not None
             ):
+                wait_start_ns = time.monotonic_ns()
+
                 self.wait_until(
                     pending_r1_end_ns
                     + pending_adc_clock.enforced_interval_ns
                 )
 
+                protocol_wait_ns += (
+                    time.monotonic_ns()
+                    - wait_start_ns
+                )
+
+            transfer_start_ns = time.monotonic_ns()
             start_ns, end_ns = self._write_register(step.value)
+            transfer_end_ns = time.monotonic_ns()
+
+            spi_transfer_ns += transfer_end_ns - transfer_start_ns
 
             if step.register == REG_R1:
                 pending_r1_end_ns = end_ns
                 pending_adc_clock = step.adc_clock_for_following_r0
 
             if step.delay_after_ns:
+                wait_start_ns = time.monotonic_ns()
+
                 self.wait_until(end_ns + step.delay_after_ns)
 
+                protocol_wait_ns += (
+                    time.monotonic_ns()
+                    - wait_start_ns
+                )
+
             if self.verbose:
-                start_us = (start_ns - sequence_start_ns) / 1000.0
-                end_us = (end_ns - sequence_start_ns) / 1000.0
-                transfer_us = (end_ns - start_ns) / 1000.0
+                start_us = (
+                    start_ns - command_start_ns
+                ) / 1000.0
+
+                end_us = (
+                    end_ns - command_start_ns
+                ) / 1000.0
+
+                transfer_us = (
+                    end_ns - start_ns
+                ) / 1000.0
 
                 if previous_end_ns is None:
                     gap_text = "n/a"
@@ -1256,19 +1350,49 @@ class ADF5355:
                 pending_r1_end_ns = None
                 pending_adc_clock = None
 
+        command_end_ns = time.monotonic_ns()
+        total_ns = command_end_ns - command_start_ns
+
+        driver_overhead_ns = max(
+            0,
+            total_ns
+            - sequence_construction_ns
+            - spi_transfer_ns
+            - protocol_wait_ns,
+        )
+
+        return CommandTimingSample(
+            total_ns=total_ns,
+            sequence_construction_ns=sequence_construction_ns,
+            spi_transfer_ns=spi_transfer_ns,
+            protocol_wait_ns=protocol_wait_ns,
+            driver_overhead_ns=driver_overhead_ns,
+        )
+
     def program_initial_frequency(
         self,
         parameters: SynthesizerParameters,
         output_power_dbm: int,
         enable_rfout_a: bool,
     ) -> None:
+        command_start_ns = time.monotonic_ns()
+        construction_start_ns = time.monotonic_ns()
+
+        steps = make_initialization_sequence(
+            parameters,
+            output_power_dbm,
+            enable_rfout_a,
+        )
+
+        construction_duration_ns = (
+            time.monotonic_ns() - construction_start_ns
+        )
+
         self.write_sequence(
-            make_initialization_sequence(
-                parameters,
-                output_power_dbm,
-                enable_rfout_a,
-            ),
+            steps,
             "Register Initialization Sequence",
+            command_start_ns=command_start_ns,
+            sequence_construction_ns=construction_duration_ns,
         )
 
     def update_frequency(
@@ -1276,7 +1400,23 @@ class ADF5355:
         parameters: SynthesizerParameters,
         output_power_dbm: int,
         enable_rfout_a: bool,
-    ) -> None:
+        command_start_ns: Optional[int] = None,
+    ) -> CommandTimingSample:
+        if command_start_ns is None:
+            command_start_ns = time.monotonic_ns()
+
+        construction_start_ns = time.monotonic_ns()
+
+        steps = make_frequency_update_sequence(
+            parameters,
+            output_power_dbm,
+            enable_rfout_a,
+        )
+
+        construction_duration_ns = (
+            time.monotonic_ns() - construction_start_ns
+        )
+
         if parameters.pfd_hz <= HIGH_PFD_THRESHOLD_HZ:
             name = "Frequency Update Sequence (fPFD <= 75 MHz)"
         else:
@@ -1285,13 +1425,11 @@ class ADF5355:
                 "(fPFD > 75 MHz; half-PFD then final-PFD)"
             )
 
-        self.write_sequence(
-            make_frequency_update_sequence(
-                parameters,
-                output_power_dbm,
-                enable_rfout_a,
-            ),
+        return self.write_sequence(
+            steps,
             name,
+            command_start_ns=command_start_ns,
+            sequence_construction_ns=construction_duration_ns,
         )
 
     def close(self) -> None:
@@ -1314,13 +1452,6 @@ def generate_sweep_frequencies(
     end_frequency: int,
     step_frequency: int,
 ):
-    """
-    Generate:
-
-        start, ..., end, ..., start, ..., end, ...
-
-    without duplicating turnaround endpoints.
-    """
     upward = [start_frequency]
     frequency = start_frequency
 
@@ -1343,7 +1474,6 @@ def iter_one_sweep_cycle(
     end_frequency: int,
     step_frequency: int,
 ):
-    """Yield one finite upward/downward cycle for validation."""
     upward = [start_frequency]
     frequency = start_frequency
 
@@ -1397,27 +1527,12 @@ def validate_sweep_arguments(
     if step_time_s <= 0:
         raise ValueError("step_time must be greater than zero")
 
-    for frequency in iter_one_sweep_cycle(
-        start_frequency,
-        end_frequency,
-        step_frequency,
-    ):
-        calculate_synthesizer_parameters(
-            frequency,
-            reference_hz,
-            reference_mode,
-            channel_spacing_hz,
-            muxout_lock_detect,
-            mute_till_lock,
-        )
-
 
 # ============================================================================
-# Absolute-deadline helper
+# Absolute deadline helper
 # ============================================================================
 
 def wait_until_returning_time(deadline_ns: int) -> int:
-    """Wait until deadline_ns and return the actual wake timestamp."""
     while True:
         remaining_ns = deadline_ns - time.monotonic_ns()
 
@@ -1449,8 +1564,8 @@ def report_direction_statistics(
     loop_overhead_durations_ns: list[int],
     command_durations_ns: list[int],
     preparation_statistics: ParameterPreparationStatistics,
+    command_statistics: CommandTimingStatistics,
 ) -> None:
-    """Print timing and detailed preparation statistics."""
     absolute_elapsed_s = (
         direction_end_ns - script_start_ns
     ) / NS_PER_SECOND
@@ -1613,6 +1728,7 @@ def report_direction_statistics(
         f"{profiled_median_ns / 1000.0:.3f} usec",
         flush=True,
     )
+
     print(
         f"[{absolute_elapsed_s:.6f} s] "
         f"{direction} preparation breakdown:",
@@ -1645,15 +1761,76 @@ def report_direction_statistics(
             flush=True,
         )
 
-    residual_mean_ns = profiled_mean_ns - section_mean_sum_ns
-    residual_median_ns = (
-        profiled_median_ns - section_median_sum_ns
+    print(
+        f"  unaccounted profiling overhead: "
+        f"mean={(profiled_mean_ns - section_mean_sum_ns) / 1000.0:.3f} usec; "
+        f"median={(profiled_median_ns - section_median_sum_ns) / 1000.0:.3f} usec",
+        flush=True,
     )
 
     print(
-        f"  unaccounted profiling overhead: "
-        f"mean={residual_mean_ns / 1000.0:.3f} usec; "
-        f"median={residual_median_ns / 1000.0:.3f} usec",
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} command breakdown:",
+        flush=True,
+    )
+
+    command_samples = {
+        section: command_statistics.section_samples_ns[section]
+        for section in COMMAND_SECTIONS
+    }
+
+    # Compute these before calculating component percentages.
+    total_command_samples = command_samples["total command time"]
+
+    command_total_mean_ns = (
+        mean(total_command_samples)
+        if total_command_samples
+        else 0.0
+    )
+
+    command_total_median_ns = (
+        median(total_command_samples)
+        if total_command_samples
+        else 0.0
+    )
+
+    command_component_mean_sum_ns = 0.0
+    command_component_median_sum_ns = 0.0
+
+    for section in COMMAND_SECTIONS:
+        samples = command_samples[section]
+
+        section_mean_ns = mean(samples) if samples else 0.0
+        section_median_ns = median(samples) if samples else 0.0
+
+        if section != "total command time":
+            command_component_mean_sum_ns += section_mean_ns
+            command_component_median_sum_ns += section_median_ns
+
+        fraction = (
+            100.0 * section_mean_ns / command_total_mean_ns
+            if command_total_mean_ns > 0
+            else 0.0
+        )
+
+        print(
+            f"  {section}: "
+            f"mean={section_mean_ns / 1000.0:.3f} usec; "
+            f"median={section_median_ns / 1000.0:.3f} usec; "
+            f"mean_fraction={fraction:.2f}%",
+            flush=True,
+        )
+
+    print(
+        f"  command accounting residual: "
+        f"mean={(
+            command_total_mean_ns
+            - command_component_mean_sum_ns
+        ) / 1000.0:.3f} usec; "
+        f"median={(
+            command_total_median_ns
+            - command_component_median_sum_ns
+        ) / 1000.0:.3f} usec",
         flush=True,
     )
 
@@ -1752,6 +1929,8 @@ def run_sweep(
         ParameterPreparationStatistics()
     )
 
+    command_statistics = CommandTimingStatistics()
+
     for frequency in generate_sweep_frequencies(
         args.start_frequency,
         args.end_frequency,
@@ -1771,6 +1950,7 @@ def run_sweep(
             args.muxout_lock_detect,
             args.mute_till_lock,
             reference_configuration=reference_configuration,
+            parameters_out=start_parameters,
             preparation_statistics=preparation_statistics,
         )
 
@@ -1789,8 +1969,6 @@ def run_sweep(
             next_step_deadline_ns
         )
 
-        # Preparation and lock waiting are excluded from overrun
-        # classification.
         if pre_deadline_work_end_ns < next_step_deadline_ns:
             wake_lateness_ns = wake_ns - next_step_deadline_ns
 
@@ -1826,17 +2004,26 @@ def run_sweep(
             - deadline_wait_ns,
         )
 
-        device.update_frequency(
+        command_timing = device.update_frequency(
             parameters,
             output_power_dbm,
             enable_rfout_a,
+            command_start_ns=command_start_ns,
         )
 
         command_end_ns = time.monotonic_ns()
 
         loop_overhead_durations_ns.append(loop_overhead_ns)
-        command_durations_ns.append(
-            command_end_ns - command_start_ns
+        command_durations_ns.append(command_timing.total_ns)
+
+        command_statistics.record(
+            sequence_construction_ns=(
+                command_timing.sequence_construction_ns
+            ),
+            spi_transfer_ns=command_timing.spi_transfer_ns,
+            protocol_wait_ns=command_timing.protocol_wait_ns,
+            driver_overhead_ns=command_timing.driver_overhead_ns,
+            total_ns=command_timing.total_ns,
         )
 
         total_steps += 1
@@ -1855,7 +2042,7 @@ def run_sweep(
             print(
                 f"[{absolute_elapsed_s:.6f} s] "
                 f"Frequency-command duration: "
-                f"{(command_end_ns - command_start_ns) / 1000.0:.3f} usec",
+                f"{command_timing.total_ns / 1000.0:.3f} usec",
                 flush=True,
             )
 
@@ -1876,6 +2063,7 @@ def run_sweep(
                     loop_overhead_durations_ns=loop_overhead_durations_ns,
                     command_durations_ns=command_durations_ns,
                     preparation_statistics=preparation_statistics,
+                    command_statistics=command_statistics,
                 )
 
             direction = "end-to-start"
@@ -1889,6 +2077,7 @@ def run_sweep(
             preparation_statistics = (
                 ParameterPreparationStatistics()
             )
+            command_statistics = CommandTimingStatistics()
 
         elif (
             frequency == args.start_frequency
@@ -1907,6 +2096,7 @@ def run_sweep(
                     loop_overhead_durations_ns=loop_overhead_durations_ns,
                     command_durations_ns=command_durations_ns,
                     preparation_statistics=preparation_statistics,
+                    command_statistics=command_statistics,
                 )
 
             direction = "start-to-end"
@@ -1920,6 +2110,7 @@ def run_sweep(
             preparation_statistics = (
                 ParameterPreparationStatistics()
             )
+            command_statistics = CommandTimingStatistics()
 
         current_frequency = frequency
 
@@ -1946,6 +2137,138 @@ class FakeSPI:
 
     def close(self) -> None:
         pass
+
+
+def parameter_signature(
+    parameters: SynthesizerParameters,
+) -> tuple:
+    return (
+        parameters.rf_out_hz,
+        parameters.reference_hz,
+        parameters.reference_mode,
+        parameters.channel_spacing_hz,
+        parameters.muxout_lock_detect,
+        parameters.mute_till_lock,
+        parameters.rf_divider,
+        parameters.vco_hz,
+        parameters.pfd_hz,
+        parameters.reference_divider,
+        parameters.reference_divide_by_2,
+        parameters.int_value,
+        parameters.frac1,
+        parameters.mod1,
+        parameters.frac2,
+        parameters.mod2,
+        parameters.adc_clock.pfd_hz,
+        parameters.adc_clock.adc_clk_div,
+        parameters.adc_clock.adc_clock_hz,
+        parameters.adc_clock.required_interval_ns,
+        parameters.adc_clock.enforced_interval_ns,
+    )
+
+
+def run_reuse_regression_test() -> None:
+    reference_configuration = build_reference_configuration(
+        125_000_000,
+        REFERENCE_MODE_SINGLE_ENDED,
+    )
+
+    frequencies = list(
+        iter_one_sweep_cycle(
+            2_000_000_000,
+            2_100_000_000,
+            1_000_000,
+        )
+    )
+
+    reusable_parameters = calculate_synthesizer_parameters(
+        frequencies[0],
+        reference_hz=125_000_000,
+        reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+        channel_spacing_hz=100_000,
+        reference_configuration=reference_configuration,
+    )
+
+    for frequency in frequencies:
+        fresh_parameters = calculate_synthesizer_parameters(
+            frequency,
+            reference_hz=125_000_000,
+            reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+            channel_spacing_hz=100_000,
+            reference_configuration=reference_configuration,
+        )
+
+        reused_parameters = calculate_synthesizer_parameters(
+            frequency,
+            reference_hz=125_000_000,
+            reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+            channel_spacing_hz=100_000,
+            reference_configuration=reference_configuration,
+            parameters_out=reusable_parameters,
+        )
+
+        assert reused_parameters is reusable_parameters
+
+        assert (
+            parameter_signature(fresh_parameters)
+            == parameter_signature(reused_parameters)
+        )
+
+        fresh_registers = make_register_map(
+            fresh_parameters,
+            output_power_dbm=5,
+            enable_rfout_a=True,
+        )
+
+        reused_registers = make_register_map(
+            reused_parameters,
+            output_power_dbm=5,
+            enable_rfout_a=True,
+        )
+
+        assert fresh_registers == reused_registers
+
+
+def run_command_profile_regression_test() -> None:
+    reference_configuration = build_reference_configuration(
+        125_000_000,
+        REFERENCE_MODE_SINGLE_ENDED,
+    )
+
+    parameters = calculate_synthesizer_parameters(
+        2_000_000_000,
+        reference_hz=125_000_000,
+        reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+        channel_spacing_hz=100_000,
+        reference_configuration=reference_configuration,
+    )
+
+    fake_spi = FakeSPI()
+    device = ADF5355(spi=fake_spi)
+
+    try:
+        timing = device.update_frequency(
+            parameters,
+            output_power_dbm=5,
+            enable_rfout_a=True,
+        )
+    finally:
+        device.close()
+
+    assert timing.total_ns > 0
+    assert timing.sequence_construction_ns >= 0
+    assert timing.spi_transfer_ns >= 0
+    assert timing.protocol_wait_ns >= 0
+    assert timing.driver_overhead_ns >= 0
+
+    accounted_ns = (
+        timing.sequence_construction_ns
+        + timing.spi_transfer_ns
+        + timing.protocol_wait_ns
+        + timing.driver_overhead_ns
+    )
+
+    assert accounted_ns <= timing.total_ns
 
 
 def run_verification() -> None:
@@ -1984,26 +2307,8 @@ def run_verification() -> None:
 
     assert differential_registers[REG_R4] == 0x3200A784
 
-    reference_configuration = build_reference_configuration(
-        125_000_000,
-        REFERENCE_MODE_SINGLE_ENDED,
-    )
-
-    profile = ParameterPreparationStatistics()
-
-    calculate_synthesizer_parameters(
-        1_800_000_000,
-        reference_hz=125_000_000,
-        reference_mode=REFERENCE_MODE_SINGLE_ENDED,
-        channel_spacing_hz=200_000,
-        reference_configuration=reference_configuration,
-        preparation_statistics=profile,
-    )
-
-    assert len(profile.total_samples_ns) == 1
-
-    for section in PROFILE_SECTIONS:
-        assert len(profile.section_samples_ns[section]) == 1
+    run_reuse_regression_test()
+    run_command_profile_regression_test()
 
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
@@ -2225,9 +2530,8 @@ def main() -> None:
         "--chirp-time-verbose",
         action="store_true",
         help=(
-            "print separate one-way timing with overrun counts and "
-            "mean/median preparation-section, loop, command, and "
-            "active-step times"
+            "print one-way timing with preparation and command "
+            "breakdowns"
         ),
     )
 
@@ -2257,8 +2561,11 @@ def main() -> None:
     parser.add_argument(
         "--max-speed-hz",
         type=spi_speed_arg,
-        default=10_000_000,
-        help="SPI0 clock rate in Hz",
+        default=DEFAULT_SPI_SPEED_HZ,
+        help=(
+            "SPI0 clock rate in Hz; valid range is "
+            f"{MIN_SPI_SPEED_HZ} to {MAX_SPI_SPEED_HZ} Hz"
+        ),
     )
 
     parser.add_argument(
