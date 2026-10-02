@@ -2,37 +2,63 @@
 """
 adf5355_pi_sweep.py
 
-ADF5355 Raspberry Pi SPI0 continuous frequency sweep driver.
+Continuous ADF5355 frequency sweep driver for Raspberry Pi SPI0.
 
-Normal operation is always continuous sweep mode. The --sweep option
-is intentionally not present.
+There is no --sweep option and no --rf-output-hz option.
 
-SPI0 wiring:
+Timing options:
 
-    Raspberry Pi                         ADF5355
-    ------------------------------------------------
-    GPIO11 / physical pin 23 / SPI0_SCLK  CLK
-    GPIO10 / physical pin 19 / SPI0_MOSI  DATA
-    GPIO8  / physical pin 24 / SPI0_CE0   LE
-    GND / physical pin 6 or 9              GND
+    --freq-step-verbose
 
-MUXOUT wiring:
+        Print absolute elapsed time, commanded frequency, and duration
+        of each individual frequency command.
 
-    Raspberry Pi                         ADF5355
-    ------------------------------------------------
-    GPIO25 / physical pin 22              MUXOUT, pin 30
-    GND                                   GND
+    --chirp-time-verbose
 
-PDBRF wiring:
+        Print separate one-way start-to-end and end-to-start timing,
+        including:
 
-    ADF5355 PDBRF, pin 26 -> ADF5355 DVDD, approximately 3.3 V
+            elapsed time
+            total steps
+            small overrun events
+            large overrun events
+            mean/median total parameter-preparation time
+            mean/median preparation-section time
+            mean/median loop-overhead time
+            mean/median command time
+            mean/median active-step time
 
-PDBRF is an active-low hardware power-down input for RFOUTA+ and
-RFOUTA-. It must not be left floating.
+Active-step time is:
 
-RFOUTB is prohibited. Only RFOUTA may be enabled.
+    parameter preparation
+    + loop overhead
+    + command execution
 
-Corrected fixed registers:
+Preparation profiling sections:
+
+    initial validation
+    reference configuration
+    RF-divider selection
+    N-divider integer arithmetic
+    MOD2/FRAC2 arithmetic
+    final validation
+    ADC-clock calculation
+    object construction
+
+Optimization changes:
+
+    1. Reference configuration and ADC-clock configuration are computed
+       once before the sweep and reused.
+
+    2. N-divider Fraction arithmetic is replaced with equivalent integer
+       arithmetic using the numerator and denominator of fPFD.
+
+    3. Synthesizer and configuration data classes use slots.
+
+    4. The profiling object is explicitly passed into the directional
+       report function.
+
+Corrected registers:
 
     Register 7  = 0x120000E7
     Register 9  = 0x0302FCC9
@@ -49,52 +75,6 @@ Register 6:
 
     CP bleed-current code = 16
     RFOUTB                = disabled
-
-Sweep operation:
-
-    The initial frequency is programmed with the complete Register
-    Initialization Sequence.
-
-    Each following frequency uses the appropriate Frequency Update
-    Sequence:
-
-        fPFD <= 75 MHz:
-            normal frequency-update sequence
-
-        fPFD > 75 MHz:
-            half-PFD update followed by final-PFD update
-
-    The sweep proceeds upward from start_frequency to end_frequency,
-    then downward to start_frequency, and repeats indefinitely.
-
-Examples:
-
-    python3 adf5355_pi_sweep.py --show-wiring
-
-    python3 adf5355_pi_sweep.py --verify
-
-    sudo python3 adf5355_pi_sweep.py \
-        --start-frequency 2000000000 \
-        --end-frequency 2200000000 \
-        --step-frequency 1000000 \
-        --step-time 0.010
-
-    sudo python3 adf5355_pi_sweep.py \
-        --start-frequency 2000000000 \
-        --end-frequency 2200000000 \
-        --step-frequency 1000000 \
-        --step-time 0.010 \
-        --wait-for-lock
-
-    sudo python3 adf5355_pi_sweep.py \
-        --start-frequency 4000000000 \
-        --end-frequency 4300000000 \
-        --step-frequency 1000000 \
-        --step-time 0.010 \
-        --reference-hz 125000000 \
-        --reference-mode differential \
-        --set-rf-output-power 5 \
-        --verbose
 """
 
 from __future__ import annotations
@@ -103,9 +83,10 @@ import argparse
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from math import gcd
+from statistics import mean, median
 from typing import Iterable, Optional
 
 try:
@@ -120,7 +101,7 @@ except ImportError:
 
 
 # ============================================================================
-# Limits and defaults
+# Constants
 # ============================================================================
 
 DEFAULT_REFERENCE_HZ = 125_000_000
@@ -186,38 +167,27 @@ ADC_CLK_DIV_MAX = 255
 
 REQUIRED_ADC_CYCLES = 16
 TIMING_MARGIN_NS = 10_000
+NS_PER_SECOND = 1_000_000_000
 
 REGISTER_7_VALUE = 0x120000E7
 REGISTER_9_VALUE = 0x0302FCC9
 
-PHASE_RESYNC_CLOCK_DIVIDER = 1
 PHASE_RESYNC_TIMEOUT = 0x041
 
 CHARGE_PUMP_CURRENT_CODE = 9
 PHASE_DETECTOR_POLARITY_POSITIVE = True
 CP_BLEED_CURRENT_CODE = 16
 
-
-DIFFERENTIAL_REFERENCE_WARNING = """
-WARNING: Differential operation selected.
-
-The physical reference source must be connected to both REFINA and
-REFINB. Selecting the command-line option only configures Register 4
-DB9; it does not convert a single-ended signal into a differential one.
-
-Differential mode permits reference frequencies up to 600 MHz.
-Single-ended mode is limited to 250 MHz.
-""".strip()
-
-
-MUXOUT_WARNING = """
-WARNING: MUXOUT monitoring is enabled.
-
-Connect ADF5355 MUXOUT, pin 30, to Raspberry Pi GPIO25,
-physical pin 22. Connect the ADF5355 ground to Raspberry Pi ground.
-
-MUXOUT is configured for 3.3 V logic. Do not apply 5 V to GPIO25.
-""".strip()
+PROFILE_SECTIONS = (
+    "initial validation",
+    "reference configuration",
+    "RF-divider selection",
+    "N-divider integer arithmetic",
+    "MOD2/FRAC2 arithmetic",
+    "final validation",
+    "ADC-clock calculation",
+    "object construction",
+)
 
 
 # ============================================================================
@@ -254,11 +224,9 @@ R2_FRAC2_SHIFT = 18
 R4_COUNTER_RESET_MASK = 1 << 4
 R4_PHASE_DETECTOR_POLARITY_MASK = 1 << 7
 R4_MUXOUT_SHIFT = 27
-R4_MUXOUT_MASK = 0x7 << R4_MUXOUT_SHIFT
 R4_MUXOUT_LOGIC_SHIFT = 8
 R4_REFERENCE_MODE_SHIFT = 9
 R4_CHARGE_PUMP_CURRENT_SHIFT = 10
-R4_CHARGE_PUMP_CURRENT_MASK = 0xF << R4_CHARGE_PUMP_CURRENT_SHIFT
 R4_R_COUNTER_SHIFT = 15
 R4_RDIV2_SHIFT = 25
 
@@ -269,12 +237,10 @@ R6_RFOUTB_ENABLE_MASK = 1 << 10
 R6_RFOUTA_ENABLE_MASK = 1 << 6
 R6_RFOUTA_POWER_SHIFT = 4
 R6_CP_BLEED_CURRENT_SHIFT = 13
-R6_CP_BLEED_CURRENT_MASK = 0xFF << R6_CP_BLEED_CURRENT_SHIFT
 
 R10_ADC_CONVERSION_ENABLE_MASK = 1 << 4
 R10_ADC_ENABLE_MASK = 1 << 5
 R10_ADC_CLK_DIV_SHIFT = 6
-R10_ADC_CLK_DIV_MASK = 0xFF << R10_ADC_CLK_DIV_SHIFT
 
 
 # ============================================================================
@@ -300,11 +266,117 @@ RF_OUTPUT_POWER_TO_CODE = {
 
 
 # ============================================================================
+# Warnings
+# ============================================================================
+
+DIFFERENTIAL_REFERENCE_WARNING = """
+WARNING: Differential operation selected.
+
+The physical reference source must be connected to both REFINA and
+REFINB. Selecting the command-line option only configures Register 4
+DB9; it does not convert a single-ended signal into a differential one.
+
+Differential mode permits reference frequencies up to 600 MHz.
+Single-ended mode is limited to 250 MHz.
+""".strip()
+
+
+MUXOUT_WARNING = """
+WARNING: MUXOUT monitoring is enabled.
+
+Connect ADF5355 MUXOUT, pin 30, to Raspberry Pi GPIO25,
+physical pin 22. Connect the ADF5355 ground to Raspberry Pi ground.
+
+MUXOUT is configured for 3.3 V logic. Do not apply 5 V to GPIO25.
+""".strip()
+
+
+# ============================================================================
+# Data classes
+# ============================================================================
+
+@dataclass
+class ParameterPreparationStatistics:
+    """Per-direction preparation profiling data."""
+
+    section_samples_ns: dict[str, list[int]] = field(
+        default_factory=lambda: {
+            section: []
+            for section in PROFILE_SECTIONS
+        }
+    )
+
+    total_samples_ns: list[int] = field(default_factory=list)
+
+    def record_section(
+        self,
+        section: str,
+        duration_ns: int,
+    ) -> None:
+        self.section_samples_ns[section].append(duration_ns)
+
+    def record_total(self, duration_ns: int) -> None:
+        self.total_samples_ns.append(duration_ns)
+
+
+@dataclass(frozen=True, slots=True)
+class ADCClockConfiguration:
+    pfd_hz: Fraction
+    adc_clk_div: int
+    adc_clock_hz: Fraction
+    required_interval_ns: int
+    enforced_interval_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceConfiguration:
+    reference_hz: int
+    reference_mode: str
+    reference_divider: int
+    reference_divide_by_2: bool
+    pfd_hz: Fraction
+    adc_clock: ADCClockConfiguration
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesizerParameters:
+    rf_out_hz: int
+    reference_hz: int
+    reference_mode: str
+    channel_spacing_hz: int
+    muxout_lock_detect: str
+    mute_till_lock: bool
+
+    rf_divider: int
+    vco_hz: int
+    pfd_hz: Fraction
+
+    reference_divider: int
+    reference_divide_by_2: bool
+
+    int_value: int
+    frac1: int
+    mod1: int
+    frac2: int
+    mod2: int
+
+    adc_clock: ADCClockConfiguration
+
+
+@dataclass(frozen=True, slots=True)
+class ProgrammingStep:
+    register: int
+    value: int
+    description: str
+    adc_clock_for_following_r0: Optional[ADCClockConfiguration] = None
+    delay_after_ns: int = 0
+
+
+# ============================================================================
 # Utility functions
 # ============================================================================
 
 def ceil_fraction(value: Fraction) -> int:
-    """Return ceil(value) for a Fraction."""
     if value.denominator == 1:
         return value.numerator
 
@@ -314,7 +386,6 @@ def ceil_fraction(value: Fraction) -> int:
 
 
 def fraction_to_float(value: Fraction) -> float:
-    """Convert a Fraction to float."""
     return value.numerator / value.denominator
 
 
@@ -351,14 +422,10 @@ def validate_rf_output_power(output_power_dbm: int) -> None:
 
 def validate_fixed_configuration() -> None:
     if not 0 <= CHARGE_PUMP_CURRENT_CODE <= 0xF:
-        raise ValueError(
-            "Charge-pump-current code must fit in four bits"
-        )
+        raise ValueError("Invalid charge-pump-current code")
 
     if not 0 <= CP_BLEED_CURRENT_CODE <= 0xFF:
-        raise ValueError(
-            "CP bleed-current code must fit in eight bits"
-        )
+        raise ValueError("Invalid CP bleed-current code")
 
 
 def muxout_code(muxout_lock_detect: str) -> int:
@@ -371,7 +438,6 @@ def muxout_code(muxout_lock_detect: str) -> int:
 
 
 def print_hardware_wiring() -> None:
-    """Print Raspberry Pi-to-ADF5355 wiring information."""
     print(
         """
 ADF5355 / Raspberry Pi hardware wiring
@@ -393,8 +459,6 @@ PDBRF:
 
     ADF5355 PDBRF, pin 26 -> ADF5355 DVDD, approximately 3.3 V
 
-    PDBRF must not be left floating.
-
 Reference input:
 
     Single-ended:  source -> REFINA
@@ -407,27 +471,13 @@ RFOUTB is disabled by this driver. Only RFOUTA is used.
 
 
 # ============================================================================
-# ADC clock
+# ADC and reference calculations
 # ============================================================================
-
-@dataclass(frozen=True)
-class ADCClockConfiguration:
-    pfd_hz: Fraction
-    adc_clk_div: int
-    adc_clock_hz: Fraction
-    required_interval_ns: int
-    enforced_interval_ns: int
-
-    @property
-    def adc_clock_khz(self) -> float:
-        return fraction_to_float(self.adc_clock_hz) / 1_000.0
-
 
 def calculate_adc_clock(
     pfd_hz: Fraction | int,
     adc_clk_div: Optional[int] = None,
 ) -> ADCClockConfiguration:
-    """Calculate ADC_CLK_DIV and timing."""
     pfd_hz = Fraction(pfd_hz)
 
     if pfd_hz <= 0:
@@ -435,10 +485,7 @@ def calculate_adc_clock(
 
     if adc_clk_div is None:
         requested_divider = ceil_fraction(
-            (
-                (pfd_hz / ADC_TARGET_HZ)
-                - 2
-            ) / 4
+            ((pfd_hz / ADC_TARGET_HZ) - 2) / 4
         )
 
         adc_clk_div = min(
@@ -453,7 +500,7 @@ def calculate_adc_clock(
 
     required_interval_ns = (
         ceil_fraction(
-            Fraction(REQUIRED_ADC_CYCLES * 1_000_000_000, 1)
+            Fraction(REQUIRED_ADC_CYCLES * NS_PER_SECOND, 1)
             / adc_clock_hz
         )
         + 1
@@ -468,55 +515,19 @@ def calculate_adc_clock(
     )
 
 
-# ============================================================================
-# Synthesizer calculation
-# ============================================================================
-
-@dataclass(frozen=True)
-class SynthesizerParameters:
-    rf_out_hz: int
-    reference_hz: int
-    reference_mode: str
-    channel_spacing_hz: int
-    muxout_lock_detect: str
-    mute_till_lock: bool
-
-    rf_divider: int
-    vco_hz: int
-    pfd_hz: Fraction
-
-    reference_divider: int
-    reference_divide_by_2: bool
-
-    int_value: int
-    frac1: int
-    mod1: int
-    frac2: int
-    mod2: int
-
-    adc_clock: ADCClockConfiguration
-
-
-@dataclass(frozen=True)
-class ProgrammingStep:
-    register: int
-    value: int
-    description: str
-    adc_clock_for_following_r0: Optional[ADCClockConfiguration] = None
-    delay_after_ns: int = 0
-
-
-def select_rf_divider(rf_out_hz: int) -> int:
-    for rf_divider in RF_DIVIDER_TO_CODE:
-        if 3_400_000_000 <= rf_out_hz * rf_divider <= 6_800_000_000:
-            return rf_divider
-
-    raise ValueError("RFOUTA frequency cannot be generated")
-
-
-def choose_reference_configuration(
+def build_reference_configuration(
     reference_hz: int,
-) -> tuple[int, bool, Fraction]:
+    reference_mode: str,
+) -> ReferenceConfiguration:
+    validate_reference_mode(reference_mode)
+
+    if not (
+        MIN_REFERENCE_HZ
+        <= reference_hz
+        <= maximum_reference_hz(reference_mode)
+    ):
+        raise ValueError("Reference frequency is outside the allowed range")
+
     reference_divide_by_2 = reference_hz >= 20_000_000
 
     base_pfd_hz = Fraction(
@@ -537,7 +548,22 @@ def choose_reference_configuration(
     if not 0 < pfd_hz <= MAX_PFD_HZ:
         raise ValueError("Calculated PFD frequency is invalid")
 
-    return reference_divider, reference_divide_by_2, pfd_hz
+    return ReferenceConfiguration(
+        reference_hz=reference_hz,
+        reference_mode=reference_mode,
+        reference_divider=reference_divider,
+        reference_divide_by_2=reference_divide_by_2,
+        pfd_hz=pfd_hz,
+        adc_clock=calculate_adc_clock(pfd_hz),
+    )
+
+
+def select_rf_divider(rf_out_hz: int) -> int:
+    for rf_divider in RF_DIVIDER_TO_CODE:
+        if 3_400_000_000 <= rf_out_hz * rf_divider <= 6_800_000_000:
+            return rf_divider
+
+    raise ValueError("RFOUTA frequency cannot be generated")
 
 
 def calculate_synthesizer_parameters(
@@ -547,59 +573,164 @@ def calculate_synthesizer_parameters(
     channel_spacing_hz: int = DEFAULT_CHANNEL_SPACING_HZ,
     muxout_lock_detect: str = DEFAULT_MUXOUT_LOCK_DETECT,
     mute_till_lock: bool = DEFAULT_MUTE_TILL_LOCK,
+    reference_configuration: Optional[
+        ReferenceConfiguration
+    ] = None,
+    preparation_statistics: Optional[
+        ParameterPreparationStatistics
+    ] = None,
 ) -> SynthesizerParameters:
+    """Calculate parameters using cached reference data when supplied."""
+    profile_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
+
     validate_fixed_configuration()
-    validate_reference_mode(reference_mode)
     validate_muxout_lock_detect(muxout_lock_detect)
 
     if not MIN_RF_OUTPUT_HZ <= rf_out_hz <= MAX_RF_OUTPUT_HZ:
         raise ValueError("RFOUTA frequency is outside the allowed range")
 
-    if not (
-        MIN_REFERENCE_HZ
-        <= reference_hz
-        <= maximum_reference_hz(reference_mode)
-    ):
-        raise ValueError("Reference frequency is outside the allowed range")
-
     if channel_spacing_hz <= 0:
         raise ValueError("Channel spacing must be positive")
 
-    reference_divider, reference_divide_by_2, pfd_hz = (
-        choose_reference_configuration(reference_hz)
+    if reference_configuration is None:
+        validate_reference_mode(reference_mode)
+
+        reference_configuration = build_reference_configuration(
+            reference_hz,
+            reference_mode,
+        )
+
+    else:
+        if (
+            reference_configuration.reference_hz != reference_hz
+            or reference_configuration.reference_mode != reference_mode
+        ):
+            raise ValueError(
+                "Cached reference configuration does not match inputs"
+            )
+
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "initial validation",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
+
+    # The reference configuration and ADC clock are cached. This section
+    # now measures the cached configuration access rather than recomputing
+    # the reference plan on every frequency step.
+    reference_divider = reference_configuration.reference_divider
+    reference_divide_by_2 = (
+        reference_configuration.reference_divide_by_2
+    )
+    pfd_hz = reference_configuration.pfd_hz
+    adc_clock = reference_configuration.adc_clock
+
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "reference configuration",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
     )
 
     rf_divider = select_rf_divider(rf_out_hz)
     vco_hz = rf_out_hz * rf_divider
 
-    n_ratio = Fraction(vco_hz, 1) / pfd_hz
-    int_value = n_ratio.numerator // n_ratio.denominator
-    fractional_part = n_ratio - int_value
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "RF-divider selection",
+            time.perf_counter_ns() - section_start_ns,
+        )
 
-    frac1 = (
-        fractional_part.numerator * MOD1
-    ) // fractional_part.denominator
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
 
-    remainder = fractional_part * MOD1 - frac1
+    # Equivalent integer arithmetic replaces repeated Fraction operations.
+    pfd_numerator = pfd_hz.numerator
+    pfd_denominator = pfd_hz.denominator
+
+    vco_numerator = vco_hz * pfd_denominator
+
+    int_value, remainder_numerator = divmod(
+        vco_numerator,
+        pfd_numerator,
+    )
+
+    frac1, frac1_remainder_numerator = divmod(
+        remainder_numerator * MOD1,
+        pfd_numerator,
+    )
+
+    remainder = frac1_remainder_numerator
+
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "N-divider integer arithmetic",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
 
     if remainder == 0:
         mod2 = MIN_MOD2
         frac2 = 0
     else:
-        mod2 = pfd_hz.numerator // gcd(
-            pfd_hz.numerator,
-            channel_spacing_hz * pfd_hz.denominator,
+        mod2 = pfd_numerator // gcd(
+            pfd_numerator,
+            channel_spacing_hz * pfd_denominator,
         )
 
         if not MIN_MOD2 <= mod2 <= MAX_MOD2:
             raise ValueError("Calculated MOD2 is invalid")
 
-        frac2_fraction = remainder * mod2
+        frac2, frac2_remainder = divmod(
+            remainder * mod2,
+            pfd_numerator,
+        )
 
-        if frac2_fraction.denominator != 1:
-            raise ValueError("Calculated FRAC2 is not an integer")
+        if frac2_remainder != 0:
+            raise ValueError(
+                "Calculated FRAC2 is not an integer"
+            )
 
-        frac2 = frac2_fraction.numerator
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "MOD2/FRAC2 arithmetic",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
 
     if not MIN_INT_4_5_PRESCALER <= int_value <= MAX_INT_4_5_PRESCALER:
         raise ValueError("Calculated INT is invalid")
@@ -610,7 +741,32 @@ def calculate_synthesizer_parameters(
     if not MIN_FRAC2 <= frac2 < mod2:
         raise ValueError("Calculated FRAC2 is invalid")
 
-    return SynthesizerParameters(
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "final validation",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
+
+    # Cached ADC-clock configuration is reused.
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "ADC-clock calculation",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+    section_start_ns = (
+        time.perf_counter_ns()
+        if preparation_statistics is not None
+        else None
+    )
+
+    parameters = SynthesizerParameters(
         rf_out_hz=rf_out_hz,
         reference_hz=reference_hz,
         reference_mode=reference_mode,
@@ -627,8 +783,20 @@ def calculate_synthesizer_parameters(
         mod1=MOD1,
         frac2=frac2,
         mod2=mod2,
-        adc_clock=calculate_adc_clock(pfd_hz),
+        adc_clock=adc_clock,
     )
+
+    if preparation_statistics is not None:
+        preparation_statistics.record_section(
+            "object construction",
+            time.perf_counter_ns() - section_start_ns,
+        )
+
+        preparation_statistics.record_total(
+            time.perf_counter_ns() - profile_start_ns
+        )
+
+    return parameters
 
 
 # ============================================================================
@@ -727,19 +895,16 @@ def make_register_6(
     if enable_rfout_a:
         value |= R6_RFOUTA_ENABLE_MASK
 
-    # RFOUTB remains disabled.
     value &= ~R6_RFOUTB_ENABLE_MASK
 
     return value
 
 
 def make_register_9() -> int:
-    """Return Register 9 = 0x0302FCC9."""
     return REGISTER_9_VALUE
 
 
 def make_register_10(parameters: SynthesizerParameters) -> int:
-    """Create Register 10 with ADC enabled."""
     value = 0x00C0000A
 
     value |= (
@@ -756,7 +921,6 @@ def make_register_10(parameters: SynthesizerParameters) -> int:
 
 
 def make_register_12() -> int:
-    """Return Register 12 = 0x0001041C."""
     return (
         (1 << 16)
         | (PHASE_RESYNC_TIMEOUT << 4)
@@ -771,7 +935,6 @@ def make_register_map(
     autocal_enabled: bool = True,
     counter_reset: bool = False,
 ) -> dict[int, int]:
-    """Create the complete ADF5355 register map."""
     return {
         REG_R0: make_register_0(parameters, autocal_enabled),
         REG_R1: make_register_1(parameters),
@@ -794,7 +957,7 @@ def make_register_map(
 
 
 # ============================================================================
-# Initialization and update sequences
+# Programming sequences
 # ============================================================================
 
 def make_initialization_sequence(
@@ -802,7 +965,6 @@ def make_initialization_sequence(
     output_power_dbm: int,
     enable_rfout_a: bool,
 ) -> list[ProgrammingStep]:
-    """Create the complete Register Initialization Sequence."""
     registers = make_register_map(
         parameters,
         output_power_dbm,
@@ -845,7 +1007,6 @@ def make_frequency_update_sequence(
     output_power_dbm: int,
     enable_rfout_a: bool,
 ) -> list[ProgrammingStep]:
-    """Select the update sequence using calculated fPFD."""
     reset = make_register_map(
         parameters,
         output_power_dbm,
@@ -913,7 +1074,6 @@ def make_frequency_update_sequence(
 # ============================================================================
 
 def read_muxout_gpio() -> int:
-    """Read GPIO25."""
     if GPIO is None:
         raise RuntimeError("RPi.GPIO is not installed")
 
@@ -927,7 +1087,6 @@ def read_muxout_gpio() -> int:
 
 
 def wait_for_digital_lock() -> None:
-    """Wait for active-high digital lock detect."""
     if GPIO is None:
         raise RuntimeError("RPi.GPIO is not installed")
 
@@ -994,7 +1153,6 @@ class ADF5355:
         return f"0x{value:08X}"
 
     def _write_register(self, value: int) -> tuple[int, int]:
-        """Write one 32-bit register."""
         if (value & 0xF) == REG_R6:
             if value & R6_RFOUTB_ENABLE_MASK:
                 raise ValueError("RFOUTB is prohibited")
@@ -1023,7 +1181,7 @@ class ADF5355:
             if remaining_ns > 100_000:
                 time.sleep(
                     (remaining_ns - 50_000)
-                    / 1_000_000_000
+                    / NS_PER_SECOND
                 )
             else:
                 time.sleep(0)
@@ -1033,7 +1191,6 @@ class ADF5355:
         steps: Iterable[ProgrammingStep],
         sequence_name: str,
     ) -> None:
-        """Write a register sequence."""
         step_list = list(steps)
         sequence_start_ns = time.monotonic_ns()
 
@@ -1152,12 +1309,18 @@ class ADF5355:
 # Sweep generation and validation
 # ============================================================================
 
-def iter_one_sweep_cycle(
+def generate_sweep_frequencies(
     start_frequency: int,
     end_frequency: int,
     step_frequency: int,
 ):
-    """Yield one unique up/down sweep cycle."""
+    """
+    Generate:
+
+        start, ..., end, ..., start, ..., end, ...
+
+    without duplicating turnaround endpoints.
+    """
     upward = [start_frequency]
     frequency = start_frequency
 
@@ -1166,31 +1329,33 @@ def iter_one_sweep_cycle(
             frequency + step_frequency,
             end_frequency,
         )
-
-        if upward[-1] != frequency:
-            upward.append(frequency)
+        upward.append(frequency)
 
     yield from upward
-    yield from reversed(upward[1:-1])
+
+    while True:
+        yield from reversed(upward[:-1])
+        yield from upward[1:]
 
 
-def generate_sweep_frequencies(
+def iter_one_sweep_cycle(
     start_frequency: int,
     end_frequency: int,
     step_frequency: int,
 ):
-    """Generate an infinite up/down sweep."""
-    cycle = list(
-        iter_one_sweep_cycle(
-            start_frequency,
-            end_frequency,
-            step_frequency,
-        )
-    )
+    """Yield one finite upward/downward cycle for validation."""
+    upward = [start_frequency]
+    frequency = start_frequency
 
-    while True:
-        yield from cycle
-        yield from cycle[1:]
+    while frequency < end_frequency:
+        frequency = min(
+            frequency + step_frequency,
+            end_frequency,
+        )
+        upward.append(frequency)
+
+    yield from upward
+    yield from reversed(upward[:-1])
 
 
 def validate_sweep_arguments(
@@ -1204,7 +1369,6 @@ def validate_sweep_arguments(
     muxout_lock_detect: str,
     mute_till_lock: bool,
 ) -> None:
-    """Validate all sweep parameters."""
     if not MIN_RF_OUTPUT_HZ <= start_frequency <= MAX_RF_OUTPUT_HZ:
         raise ValueError("start_frequency is outside the RFOUTA range")
 
@@ -1248,13 +1412,263 @@ def validate_sweep_arguments(
         )
 
 
+# ============================================================================
+# Absolute-deadline helper
+# ============================================================================
+
+def wait_until_returning_time(deadline_ns: int) -> int:
+    """Wait until deadline_ns and return the actual wake timestamp."""
+    while True:
+        remaining_ns = deadline_ns - time.monotonic_ns()
+
+        if remaining_ns <= 0:
+            return time.monotonic_ns()
+
+        if remaining_ns > 100_000:
+            time.sleep(
+                (remaining_ns - 50_000)
+                / NS_PER_SECOND
+            )
+        else:
+            time.sleep(0)
+
+
+# ============================================================================
+# Direction reporting
+# ============================================================================
+
+def report_direction_statistics(
+    direction: str,
+    script_start_ns: int,
+    direction_start_ns: int,
+    direction_end_ns: int,
+    total_steps: int,
+    small_overruns: int,
+    large_overruns: int,
+    preparation_durations_ns: list[int],
+    loop_overhead_durations_ns: list[int],
+    command_durations_ns: list[int],
+    preparation_statistics: ParameterPreparationStatistics,
+) -> None:
+    """Print timing and detailed preparation statistics."""
+    absolute_elapsed_s = (
+        direction_end_ns - script_start_ns
+    ) / NS_PER_SECOND
+
+    direction_duration_s = (
+        direction_end_ns - direction_start_ns
+    ) / NS_PER_SECOND
+
+    preparation_mean_ns = (
+        mean(preparation_durations_ns)
+        if preparation_durations_ns
+        else 0.0
+    )
+
+    preparation_median_ns = (
+        median(preparation_durations_ns)
+        if preparation_durations_ns
+        else 0.0
+    )
+
+    loop_mean_ns = (
+        mean(loop_overhead_durations_ns)
+        if loop_overhead_durations_ns
+        else 0.0
+    )
+
+    loop_median_ns = (
+        median(loop_overhead_durations_ns)
+        if loop_overhead_durations_ns
+        else 0.0
+    )
+
+    command_mean_ns = (
+        mean(command_durations_ns)
+        if command_durations_ns
+        else 0.0
+    )
+
+    command_median_ns = (
+        median(command_durations_ns)
+        if command_durations_ns
+        else 0.0
+    )
+
+    active_durations_ns = [
+        preparation_ns + loop_ns + command_ns
+        for preparation_ns, loop_ns, command_ns in zip(
+            preparation_durations_ns,
+            loop_overhead_durations_ns,
+            command_durations_ns,
+        )
+    ]
+
+    active_mean_ns = (
+        mean(active_durations_ns)
+        if active_durations_ns
+        else 0.0
+    )
+
+    active_median_ns = (
+        median(active_durations_ns)
+        if active_durations_ns
+        else 0.0
+    )
+
+    profiled_mean_ns = (
+        mean(preparation_statistics.total_samples_ns)
+        if preparation_statistics.total_samples_ns
+        else 0.0
+    )
+
+    profiled_median_ns = (
+        median(preparation_statistics.total_samples_ns)
+        if preparation_statistics.total_samples_ns
+        else 0.0
+    )
+
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"One-way {direction} elapsed time: "
+        f"{direction_duration_s:.6f} s",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} total steps: "
+        f"{total_steps}",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} small overrun events: "
+        f"{small_overruns}",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} large overrun events: "
+        f"{large_overruns}",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} mean parameter-preparation time: "
+        f"{preparation_mean_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} median parameter-preparation time: "
+        f"{preparation_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} mean loop-overhead time: "
+        f"{loop_mean_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} median loop-overhead time: "
+        f"{loop_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} mean command time: "
+        f"{command_mean_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} median command time: "
+        f"{command_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} mean active step time: "
+        f"{active_mean_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} median active step time: "
+        f"{active_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} profiled preparation mean: "
+        f"{profiled_mean_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} profiled preparation median: "
+        f"{profiled_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+    print(
+        f"[{absolute_elapsed_s:.6f} s] "
+        f"{direction} preparation breakdown:",
+        flush=True,
+    )
+
+    section_mean_sum_ns = 0.0
+    section_median_sum_ns = 0.0
+
+    for section in PROFILE_SECTIONS:
+        samples = preparation_statistics.section_samples_ns[section]
+
+        section_mean_ns = mean(samples) if samples else 0.0
+        section_median_ns = median(samples) if samples else 0.0
+
+        section_mean_sum_ns += section_mean_ns
+        section_median_sum_ns += section_median_ns
+
+        fraction = (
+            100.0 * section_mean_ns / profiled_mean_ns
+            if profiled_mean_ns > 0
+            else 0.0
+        )
+
+        print(
+            f"  {section}: "
+            f"mean={section_mean_ns / 1000.0:.3f} usec; "
+            f"median={section_median_ns / 1000.0:.3f} usec; "
+            f"mean_fraction={fraction:.2f}%",
+            flush=True,
+        )
+
+    residual_mean_ns = profiled_mean_ns - section_mean_sum_ns
+    residual_median_ns = (
+        profiled_median_ns - section_median_sum_ns
+    )
+
+    print(
+        f"  unaccounted profiling overhead: "
+        f"mean={residual_mean_ns / 1000.0:.3f} usec; "
+        f"median={residual_median_ns / 1000.0:.3f} usec",
+        flush=True,
+    )
+
+
+# ============================================================================
+# Sweep execution
+# ============================================================================
+
 def run_sweep(
     device: ADF5355,
     args: argparse.Namespace,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    script_start_ns: int,
 ) -> None:
-    """Run the continuous sweep forever."""
     validate_sweep_arguments(
         args.start_frequency,
         args.end_frequency,
@@ -1278,6 +1692,11 @@ def run_sweep(
                 "--wait-for-lock requires RPi.GPIO"
             )
 
+    reference_configuration = build_reference_configuration(
+        args.reference_hz,
+        args.reference_mode,
+    )
+
     start_parameters = calculate_synthesizer_parameters(
         args.start_frequency,
         args.reference_hz,
@@ -1285,7 +1704,10 @@ def run_sweep(
         args.channel_spacing_hz,
         args.muxout_lock_detect,
         args.mute_till_lock,
+        reference_configuration=reference_configuration,
     )
+
+    initial_command_start_ns = time.monotonic_ns()
 
     device.program_initial_frequency(
         start_parameters,
@@ -1293,8 +1715,42 @@ def run_sweep(
         enable_rfout_a,
     )
 
+    initial_command_end_ns = time.monotonic_ns()
+
+    if args.freq_step_verbose:
+        print(
+            f"[{(initial_command_end_ns - script_start_ns) / 1e9:.6f} s] "
+            f"Current frequency commanded: "
+            f"{args.start_frequency} Hz",
+            flush=True,
+        )
+        print(
+            f"[{(initial_command_end_ns - script_start_ns) / 1e9:.6f} s] "
+            f"Frequency-command duration: "
+            f"{(initial_command_end_ns - initial_command_start_ns) / 1000.0:.3f} usec",
+            flush=True,
+        )
+
+    direction = "start-to-end"
+    direction_start_ns = initial_command_end_ns
+
+    step_period_ns = int(round(args.step_time * NS_PER_SECOND))
+    next_step_deadline_ns = initial_command_end_ns + step_period_ns
+
     current_frequency = args.start_frequency
     first_frequency = True
+
+    total_steps = 0
+    small_overruns = 0
+    large_overruns = 0
+
+    preparation_durations_ns: list[int] = []
+    loop_overhead_durations_ns: list[int] = []
+    command_durations_ns: list[int] = []
+
+    preparation_statistics = (
+        ParameterPreparationStatistics()
+    )
 
     for frequency in generate_sweep_frequencies(
         args.start_frequency,
@@ -1305,10 +1761,7 @@ def run_sweep(
             first_frequency = False
             continue
 
-        time.sleep(args.step_time)
-
-        if args.wait_for_lock:
-            wait_for_digital_lock()
+        preparation_start_ns = time.monotonic_ns()
 
         parameters = calculate_synthesizer_parameters(
             frequency,
@@ -1317,14 +1770,61 @@ def run_sweep(
             args.channel_spacing_hz,
             args.muxout_lock_detect,
             args.mute_till_lock,
+            reference_configuration=reference_configuration,
+            preparation_statistics=preparation_statistics,
         )
 
+        preparation_end_ns = time.monotonic_ns()
+
+        preparation_durations_ns.append(
+            preparation_end_ns - preparation_start_ns
+        )
+
+        if args.wait_for_lock:
+            wait_for_digital_lock()
+
+        pre_deadline_work_end_ns = time.monotonic_ns()
+
+        wake_ns = wait_until_returning_time(
+            next_step_deadline_ns
+        )
+
+        # Preparation and lock waiting are excluded from overrun
+        # classification.
+        if pre_deadline_work_end_ns < next_step_deadline_ns:
+            wake_lateness_ns = wake_ns - next_step_deadline_ns
+
+            if wake_lateness_ns > 0:
+                if wake_lateness_ns < step_period_ns:
+                    small_overruns += 1
+                else:
+                    large_overruns += 1
+
         if args.verbose:
-            direction = "up" if frequency > current_frequency else "down"
+            step_direction = (
+                "up"
+                if frequency > current_frequency
+                else "down"
+            )
+
             print(
-                f"Sweep step {direction}: "
+                f"Sweep step {step_direction}: "
                 f"{current_frequency} -> {frequency} Hz"
             )
+
+        deadline_wait_ns = max(
+            0,
+            wake_ns - pre_deadline_work_end_ns,
+        )
+
+        command_start_ns = time.monotonic_ns()
+
+        loop_overhead_ns = max(
+            0,
+            command_start_ns
+            - pre_deadline_work_end_ns
+            - deadline_wait_ns,
+        )
 
         device.update_frequency(
             parameters,
@@ -1332,7 +1832,103 @@ def run_sweep(
             enable_rfout_a,
         )
 
+        command_end_ns = time.monotonic_ns()
+
+        loop_overhead_durations_ns.append(loop_overhead_ns)
+        command_durations_ns.append(
+            command_end_ns - command_start_ns
+        )
+
+        total_steps += 1
+
+        if args.freq_step_verbose:
+            absolute_elapsed_s = (
+                command_end_ns - script_start_ns
+            ) / NS_PER_SECOND
+
+            print(
+                f"[{absolute_elapsed_s:.6f} s] "
+                f"Current frequency commanded: "
+                f"{frequency} Hz",
+                flush=True,
+            )
+            print(
+                f"[{absolute_elapsed_s:.6f} s] "
+                f"Frequency-command duration: "
+                f"{(command_end_ns - command_start_ns) / 1000.0:.3f} usec",
+                flush=True,
+            )
+
+        if (
+            frequency == args.end_frequency
+            and direction == "start-to-end"
+        ):
+            if args.chirp_time_verbose:
+                report_direction_statistics(
+                    direction="start-to-end",
+                    script_start_ns=script_start_ns,
+                    direction_start_ns=direction_start_ns,
+                    direction_end_ns=command_end_ns,
+                    total_steps=total_steps,
+                    small_overruns=small_overruns,
+                    large_overruns=large_overruns,
+                    preparation_durations_ns=preparation_durations_ns,
+                    loop_overhead_durations_ns=loop_overhead_durations_ns,
+                    command_durations_ns=command_durations_ns,
+                    preparation_statistics=preparation_statistics,
+                )
+
+            direction = "end-to-start"
+            direction_start_ns = command_end_ns
+            total_steps = 0
+            small_overruns = 0
+            large_overruns = 0
+            preparation_durations_ns.clear()
+            loop_overhead_durations_ns.clear()
+            command_durations_ns.clear()
+            preparation_statistics = (
+                ParameterPreparationStatistics()
+            )
+
+        elif (
+            frequency == args.start_frequency
+            and direction == "end-to-start"
+        ):
+            if args.chirp_time_verbose:
+                report_direction_statistics(
+                    direction="end-to-start",
+                    script_start_ns=script_start_ns,
+                    direction_start_ns=direction_start_ns,
+                    direction_end_ns=command_end_ns,
+                    total_steps=total_steps,
+                    small_overruns=small_overruns,
+                    large_overruns=large_overruns,
+                    preparation_durations_ns=preparation_durations_ns,
+                    loop_overhead_durations_ns=loop_overhead_durations_ns,
+                    command_durations_ns=command_durations_ns,
+                    preparation_statistics=preparation_statistics,
+                )
+
+            direction = "start-to-end"
+            direction_start_ns = command_end_ns
+            total_steps = 0
+            small_overruns = 0
+            large_overruns = 0
+            preparation_durations_ns.clear()
+            loop_overhead_durations_ns.clear()
+            command_durations_ns.clear()
+            preparation_statistics = (
+                ParameterPreparationStatistics()
+            )
+
         current_frequency = frequency
+
+        next_step_deadline_ns += step_period_ns
+
+        now_ns = time.monotonic_ns()
+
+        if next_step_deadline_ns < now_ns - step_period_ns:
+            next_step_deadline_ns = now_ns + step_period_ns
 
 
 # ============================================================================
@@ -1353,7 +1949,6 @@ class FakeSPI:
 
 
 def run_verification() -> None:
-    """Run software-only checks."""
     parameters = calculate_synthesizer_parameters(
         1_800_000_000,
         reference_hz=125_000_000,
@@ -1388,6 +1983,27 @@ def run_verification() -> None:
     )
 
     assert differential_registers[REG_R4] == 0x3200A784
+
+    reference_configuration = build_reference_configuration(
+        125_000_000,
+        REFERENCE_MODE_SINGLE_ENDED,
+    )
+
+    profile = ParameterPreparationStatistics()
+
+    calculate_synthesizer_parameters(
+        1_800_000_000,
+        reference_hz=125_000_000,
+        reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+        channel_spacing_hz=200_000,
+        reference_configuration=reference_configuration,
+        preparation_statistics=profile,
+    )
+
+    assert len(profile.total_samples_ns) == 1
+
+    for section in PROFILE_SECTIONS:
+        assert len(profile.section_samples_ns[section]) == 1
 
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
@@ -1511,6 +2127,8 @@ def positive_float(value: str) -> float:
 # ============================================================================
 
 def main() -> None:
+    script_start_ns = time.monotonic_ns()
+
     parser = argparse.ArgumentParser(
         description="Continuously sweep ADF5355 RFOUTA through SPI0"
     )
@@ -1526,8 +2144,6 @@ def main() -> None:
         action="store_true",
         help="run software-only checks",
     )
-
-    # No --sweep option is present. Normal operation is always sweep mode.
 
     parser.add_argument(
         "--start-frequency",
@@ -1550,7 +2166,7 @@ def main() -> None:
     parser.add_argument(
         "--step-time",
         type=positive_float,
-        help="time between sweep steps in seconds",
+        help="nominal time between sweep commands in seconds",
     )
 
     parser.add_argument(
@@ -1594,6 +2210,25 @@ def main() -> None:
         "--check-muxout",
         action="store_true",
         help="read MUXOUT on GPIO25 after initial programming",
+    )
+
+    parser.add_argument(
+        "--freq-step-verbose",
+        action="store_true",
+        help=(
+            "print absolute elapsed time, commanded frequency, and "
+            "individual frequency-command duration"
+        ),
+    )
+
+    parser.add_argument(
+        "--chirp-time-verbose",
+        action="store_true",
+        help=(
+            "print separate one-way timing with overrun counts and "
+            "mean/median preparation-section, loop, command, and "
+            "active-step times"
+        ),
     )
 
     parser.add_argument(
@@ -1711,6 +2346,7 @@ def main() -> None:
                 args,
                 output_power_dbm,
                 enable_rfout_a,
+                script_start_ns,
             )
 
     except KeyboardInterrupt:
