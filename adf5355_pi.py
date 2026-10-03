@@ -312,6 +312,24 @@ def fraction_to_float(value: Fraction) -> float:
     return value.numerator / value.denominator
 
 
+def print_n_divider_configuration(
+    parameters: SynthesizerParameters,
+) -> None:
+    """Print the selected N-divider values for verbose operation."""
+    calculation_mode = (
+        "integer-N"
+        if parameters.frac1 == 0 and parameters.frac2 == 0
+        else "fractional-N"
+    )
+    print(f"N-divider calculation mode: {calculation_mode}")
+    print(
+        f"N: {parameters.int_value}, "
+        f"FRAC1: {parameters.frac1}, "
+        f"FRAC2: {parameters.frac2}, "
+        f"MOD2: {parameters.mod2}"
+    )
+
+
 def validate_reference_mode(reference_mode: str) -> None:
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(
@@ -1495,6 +1513,9 @@ def main() -> None:
 
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
+
+    if args.verbose:
+        print_n_divider_configuration(parameters)
 
     try:
         with ADF5355(

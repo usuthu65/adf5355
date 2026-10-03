@@ -457,6 +457,24 @@ def ceil_fraction(value: Fraction) -> int:
     ) // value.denominator
 
 
+def print_n_divider_configuration(
+    parameters: SynthesizerParameters,
+) -> None:
+    """Print the selected N-divider values for verbose operation."""
+    calculation_mode = (
+        "integer-N"
+        if parameters.frac1 == 0 and parameters.frac2 == 0
+        else "fractional-N"
+    )
+    print(f"N-divider calculation mode: {calculation_mode}")
+    print(
+        f"N: {parameters.int_value}, "
+        f"FRAC1: {parameters.frac1}, "
+        f"FRAC2: {parameters.frac2}, "
+        f"MOD2: {parameters.mod2}"
+    )
+
+
 def validate_reference_mode(reference_mode: str) -> None:
     if reference_mode not in REFERENCE_MODES:
         raise ValueError(
@@ -2235,6 +2253,9 @@ def run_sweep(
         reference_configuration=reference_configuration,
     )
 
+    if args.verbose:
+        print_n_divider_configuration(start_parameters)
+
     initial_command_start_ns = time.monotonic_ns()
 
     device.program_initial_frequency(
@@ -2342,6 +2363,7 @@ def run_sweep(
                 f"Sweep step {step_direction}: "
                 f"{current_frequency} -> {frequency} Hz"
             )
+            print_n_divider_configuration(parameters)
 
         deadline_wait_ns = max(
             0,
