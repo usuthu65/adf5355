@@ -27,7 +27,7 @@ PDBRF:
 PDBRF is an active-low hardware power-down input for RFOUTA+ and
 RFOUTA-. It must not be left floating.
 
-RFOUTB is prohibited. Only RFOUTA may be enabled.
+RFOUTB is disabled by default and can be enabled explicitly.
 
 Corrected fixed registers:
 
@@ -412,7 +412,7 @@ Reference input:
     Differential:  source+ -> REFINA
                    source- -> REFINB
 
-RFOUTB is disabled by this driver. Only RFOUTA is used.
+RFOUTB is disabled by default. Use --enable-rf-output-b to enable it.
 """
     )
 
@@ -756,6 +756,7 @@ def make_register_6(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
 ) -> int:
     validate_rf_output_power(output_power_dbm)
 
@@ -781,8 +782,8 @@ def make_register_6(
     if enable_rfout_a:
         value |= R6_RFOUTA_ENABLE_MASK
 
-    # RFOUTB must remain disabled.
-    value &= ~R6_RFOUTB_ENABLE_MASK
+    if enable_rfout_b:
+        value |= R6_RFOUTB_ENABLE_MASK
 
     return value
 
@@ -863,6 +864,7 @@ def make_register_map(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
     autocal_enabled: bool = True,
     counter_reset: bool = False,
 ) -> dict[int, int]:
@@ -878,6 +880,7 @@ def make_register_map(
             parameters,
             output_power_dbm,
             enable_rfout_a,
+            enable_rfout_b,
         ),
         REG_R7: REGISTER_7_VALUE,
         REG_R8: 0x102D0428,
@@ -896,12 +899,14 @@ def make_initialization_sequence(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
 ) -> list[ProgrammingStep]:
     """Create the complete Register Initialization Sequence."""
     registers = make_register_map(
         parameters,
         output_power_dbm,
         enable_rfout_a,
+        enable_rfout_b,
     )
 
     order = [
@@ -939,12 +944,14 @@ def make_frequency_update_sequence(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
 ) -> list[ProgrammingStep]:
     """Select the update sequence using calculated fPFD."""
     reset = make_register_map(
         parameters,
         output_power_dbm,
         enable_rfout_a,
+        enable_rfout_b,
         autocal_enabled=False,
         counter_reset=True,
     )
@@ -953,6 +960,7 @@ def make_frequency_update_sequence(
         parameters,
         output_power_dbm,
         enable_rfout_a,
+        enable_rfout_b,
         autocal_enabled=True,
         counter_reset=False,
     )
@@ -1102,10 +1110,6 @@ class ADF5355:
 
     def _write_register(self, value: int) -> tuple[int, int]:
         """Write one 32-bit register."""
-        if (value & 0xF) == REG_R6:
-            if value & R6_RFOUTB_ENABLE_MASK:
-                raise ValueError("RFOUTB is prohibited")
-
         data = [
             (value >> 24) & 0xFF,
             (value >> 16) & 0xFF,
@@ -1211,12 +1215,14 @@ class ADF5355:
         parameters: SynthesizerParameters,
         output_power_dbm: int,
         enable_rfout_a: bool,
+        enable_rfout_b: bool = False,
     ) -> None:
         self.write_sequence(
             make_initialization_sequence(
                 parameters,
                 output_power_dbm,
                 enable_rfout_a,
+                enable_rfout_b,
             ),
             "Register Initialization Sequence",
         )
@@ -1266,6 +1272,15 @@ def run_verification() -> None:
     assert registers[REG_R9] == 0x1B1A7CC9
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
+    assert not registers[REG_R6] & R6_RFOUTB_ENABLE_MASK
+
+    rfout_b_register_6 = make_register_6(
+        parameters,
+        output_power_dbm=5,
+        enable_rfout_a=True,
+        enable_rfout_b=True,
+    )
+    assert rfout_b_register_6 & R6_RFOUTB_ENABLE_MASK
 
     integer_parameters = calculate_synthesizer_parameters(
         1_000_000_000,
@@ -1322,14 +1337,8 @@ def run_verification() -> None:
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
 
-    try:
-        device._write_register(
-            REG_R6 | R6_RFOUTB_ENABLE_MASK
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("RFOUTB was not rejected")
+    device._write_register(REG_R6 | R6_RFOUTB_ENABLE_MASK)
+    assert fake_spi.transfers[-1] == [0, 0, 4, 6]
 
     device.close()
 
@@ -1547,6 +1556,12 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--enable-rf-output-b",
+        action="store_true",
+        help="enable RFOUTB (disabled by default)",
+    )
+
+    parser.add_argument(
         "--max-speed-hz",
         type=spi_speed_arg,
         default=10_000_000,
@@ -1631,6 +1646,7 @@ def main() -> None:
                 parameters,
                 output_power_dbm,
                 not args.disable_rf_output,
+                args.enable_rf_output_b,
             )
 
             if args.check_muxout:
@@ -1686,7 +1702,7 @@ def main() -> None:
     else:
         print("Negative bleed current: disabled (integer-N mode)")
     print(f"RFOUTA power: {output_power_dbm:+d} dBm")
-    print("RFOUTB enabled: False")
+    print(f"RFOUTB enabled: {args.enable_rf_output_b}")
 
     if args.check_muxout:
         print(

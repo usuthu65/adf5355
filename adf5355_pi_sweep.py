@@ -70,7 +70,8 @@ Register 4:
     MUXOUT logic level       = 3.3 V
 
 Register 6 negative bleed is disabled for integer-N operation and
-calculated automatically for fractional-N operation. RFOUTB is disabled.
+calculated automatically for fractional-N operation. RFOUTB is disabled by
+default and can be enabled explicitly.
 """
 
 from __future__ import annotations
@@ -560,7 +561,7 @@ Reference input:
     Differential:  source+ -> REFINA
                    source- -> REFINB
 
-RFOUTB is disabled by this driver. Only RFOUTA is used.
+RFOUTB is disabled by default. Use --enable-rf-output-b to enable it.
 """
     )
 
@@ -1027,6 +1028,7 @@ def make_register_6(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
 ) -> int:
     validate_rf_output_power(output_power_dbm)
 
@@ -1057,7 +1059,8 @@ def make_register_6(
     if enable_rfout_a:
         value |= R6_RFOUTA_ENABLE_MASK
 
-    value &= ~R6_RFOUTB_ENABLE_MASK
+    if enable_rfout_b:
+        value |= R6_RFOUTB_ENABLE_MASK
 
     return value
 
@@ -1137,6 +1140,7 @@ def make_register_map(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
     autocal_enabled: bool = True,
     counter_reset: bool = False,
 ) -> dict[int, int]:
@@ -1151,6 +1155,7 @@ def make_register_map(
             parameters,
             output_power_dbm,
             enable_rfout_a,
+            enable_rfout_b,
         ),
         REG_R7: REGISTER_7_VALUE,
         REG_R8: 0x102D0428,
@@ -1169,11 +1174,13 @@ def make_initialization_sequence(
     parameters: SynthesizerParameters,
     output_power_dbm: int,
     enable_rfout_a: bool,
+    enable_rfout_b: bool = False,
 ) -> list[ProgrammingStep]:
     registers = make_register_map(
         parameters,
         output_power_dbm,
         enable_rfout_a,
+        enable_rfout_b,
     )
 
     order = [
@@ -1588,10 +1595,6 @@ class ADF5355:
         return f"0x{value:08X}"
 
     def _write_register(self, value: int) -> tuple[int, int]:
-        if (value & 0xF) == REG_R6:
-            if value & R6_RFOUTB_ENABLE_MASK:
-                raise ValueError("RFOUTB is prohibited")
-
         data = [
             (value >> 24) & 0xFF,
             (value >> 16) & 0xFF,
@@ -1769,6 +1772,7 @@ class ADF5355:
         parameters: SynthesizerParameters,
         output_power_dbm: int,
         enable_rfout_a: bool,
+        enable_rfout_b: bool = False,
     ) -> None:
         command_start_ns = time.monotonic_ns()
         construction_start_ns = time.monotonic_ns()
@@ -1777,6 +1781,7 @@ class ADF5355:
             parameters,
             output_power_dbm,
             enable_rfout_a,
+            enable_rfout_b,
         )
 
         construction_duration_ns = (
@@ -2325,6 +2330,7 @@ def run_sweep(
         start_parameters,
         output_power_dbm,
         enable_rfout_a,
+        args.enable_rf_output_b,
     )
 
     initial_command_end_ns = time.monotonic_ns()
@@ -2941,6 +2947,15 @@ def run_verification() -> None:
     assert registers[REG_R9] == 0x1B1A7CC9
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
+    assert not registers[REG_R6] & R6_RFOUTB_ENABLE_MASK
+
+    rfout_b_register_6 = make_register_6(
+        parameters,
+        output_power_dbm=5,
+        enable_rfout_a=True,
+        enable_rfout_b=True,
+    )
+    assert rfout_b_register_6 & R6_RFOUTB_ENABLE_MASK
 
     integer_parameters = calculate_synthesizer_parameters(
         1_000_000_000,
@@ -3017,14 +3032,8 @@ def run_verification() -> None:
     fake_spi = FakeSPI()
     device = ADF5355(spi=fake_spi)
 
-    try:
-        device._write_register(
-            REG_R6 | R6_RFOUTB_ENABLE_MASK
-        )
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("RFOUTB was not rejected")
+    device._write_register(REG_R6 | R6_RFOUTB_ENABLE_MASK)
+    assert fake_spi.transfers[-1] == [0, 0, 4, 6]
 
     device.close()
 
@@ -3297,6 +3306,12 @@ def main() -> None:
         "--disable-rf-output",
         action="store_true",
         help="disable RFOUTA",
+    )
+
+    parser.add_argument(
+        "--enable-rf-output-b",
+        action="store_true",
+        help="enable RFOUTB (disabled by default)",
     )
 
     parser.add_argument(
