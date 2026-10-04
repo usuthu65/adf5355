@@ -1668,6 +1668,10 @@ def main() -> None:
         f"{parameters.rf_out_hz / 1e6:.9f} MHz"
     )
     print(
+        f"RFOUTB (VCO): "
+        f"{parameters.vco_hz / 1e6:.9f} MHz"
+    )
+    print(
         f"Reference input: "
         f"{parameters.reference_hz / 1e6:.9f} MHz"
     )
@@ -1678,16 +1682,6 @@ def main() -> None:
     print(f"Reference mode: {parameters.reference_mode}")
     print(f"MUXOUT function: {parameters.muxout_lock_detect}")
     print("MUXOUT logic level: 3.3 V")
-    print(f"Register 7: 0x{REGISTER_7_VALUE:08X}")
-    print(
-        f"Register 9: "
-        f"0x{make_register_9(parameters):08X}"
-    )
-    print(
-        f"Register 10: "
-        f"0x{make_register_10(parameters):08X}"
-    )
-    print(f"Register 12: 0x{make_register_12():08X}")
     print(f"Mute till lock detect: {parameters.mute_till_lock}")
     print(
         "Charge-pump current: "
