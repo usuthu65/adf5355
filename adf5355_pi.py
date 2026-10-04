@@ -316,6 +316,22 @@ def rfouta_pfd_multiplier(
     return Fraction(parameters.rf_out_hz, 1) / parameters.pfd_hz
 
 
+def print_reference_to_pfd_divider(
+    parameters: SynthesizerParameters,
+) -> None:
+    """Print the complete divider between the reference input and PFD."""
+    reference_to_pfd_divider = parameters.reference_divider
+    reference_to_pfd_description = str(parameters.reference_divider)
+    if parameters.reference_divide_by_2:
+        reference_to_pfd_divider *= 2
+        reference_to_pfd_description += " × 2"
+    print(
+        "Reference-to-PFD divider: "
+        f"{reference_to_pfd_description} = "
+        f"{reference_to_pfd_divider}"
+    )
+
+
 def print_n_divider_configuration(
     parameters: SynthesizerParameters,
 ) -> None:
@@ -332,17 +348,7 @@ def print_n_divider_configuration(
         f"FRAC2: {parameters.frac2}, "
         f"MOD2: {parameters.mod2}"
     )
-    reference_to_pfd_divider = parameters.reference_divider
-    reference_to_pfd_description = str(parameters.reference_divider)
-    if parameters.reference_divide_by_2:
-        reference_to_pfd_divider *= 2
-        reference_to_pfd_description += " × 2"
     print(f"RF divider: {parameters.rf_divider}")
-    print(
-        "Reference-to-PFD divider: "
-        f"{reference_to_pfd_description} = "
-        f"{reference_to_pfd_divider}"
-    )
     multiplier = rfouta_pfd_multiplier(parameters)
     if calculation_mode == "integer-N":
         print(
@@ -1714,6 +1720,7 @@ def main() -> None:
         f"{fraction_to_float(parameters.pfd_hz) / 1e6:.9f} MHz"
     )
     if args.verbose:
+        print_reference_to_pfd_divider(parameters)
         print_n_divider_configuration(parameters)
     print(f"Reference mode: {parameters.reference_mode}")
     print(f"MUXOUT function: {parameters.muxout_lock_detect}")
