@@ -1452,8 +1452,11 @@ def main() -> None:
         default=DEFAULT_CHARGE_PUMP_CURRENT_CODE,
         metavar="CODE",
         help=(
-            "Register 4 charge-pump-current code: 0 to 15 "
-            "(0.3125 to 5.0000 mA)"
+            "Register 4 charge-pump-current code. Current mapping "
+            "(mA): 0=0.3125, 1=0.6250, 2=0.9375, 3=1.2500, "
+            "4=1.5625, 5=1.8750, 6=2.1875, 7=2.5000, "
+            "8=2.8125, 9=3.1250, 10=3.4375, 11=3.7500, "
+            "12=4.0625, 13=4.3750, 14=4.6875, 15=5.0000"
         ),
     )
 
