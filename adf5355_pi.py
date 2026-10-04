@@ -614,7 +614,7 @@ def negative_bleed_current_report(
     return (
         "Negative bleed current: enabled; "
         f"code {parameters.negative_bleed_current_code} / "
-        f"NMAX ({NEGATIVE_BLEED_CURRENT_CODE_COUNT}); "
+        f"{NEGATIVE_BLEED_CURRENT_CODE_COUNT}; "
         f"{float(parameters.negative_bleed_current_ma) * 1000:.3f} uA; "
         f"maximum {float(maximum_current_ma) * 1000:.3f} uA"
     )
@@ -1375,7 +1375,7 @@ def run_verification() -> None:
     assert rfouta_pfd_multiplier(parameters) == Fraction(192, 5)
     assert parameters.negative_bleed_current_code == 14
     assert (
-        "code 14 / NMAX (256); 170.898 uA; "
+        "code 14 / 256; 170.898 uA; "
         "maximum 3112.793 uA"
         in negative_bleed_current_report(parameters)
     )
