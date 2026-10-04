@@ -461,6 +461,13 @@ def ceil_fraction(value: Fraction) -> int:
     ) // value.denominator
 
 
+def rfouta_pfd_multiplier(
+    parameters: SynthesizerParameters,
+) -> Fraction:
+    """Return the exact multiplier from PFD to RFOUTA."""
+    return Fraction(parameters.rf_out_hz, 1) / parameters.pfd_hz
+
+
 def print_n_divider_configuration(
     parameters: SynthesizerParameters,
 ) -> None:
@@ -477,6 +484,23 @@ def print_n_divider_configuration(
         f"FRAC2: {parameters.frac2}, "
         f"MOD2: {parameters.mod2}"
     )
+    multiplier = rfouta_pfd_multiplier(parameters)
+    if calculation_mode == "integer-N":
+        print(
+            "RFOUTA/PFD multiplier: N / RF divider = "
+            f"{parameters.int_value} / {parameters.rf_divider} = "
+            f"{float(multiplier):.9f}"
+        )
+    else:
+        print(
+            "RFOUTA/PFD multiplier: "
+            "(N + (FRAC1 + FRAC2/MOD2) / MOD1) / RF divider = "
+            f"({parameters.int_value} + "
+            f"({parameters.frac1} + {parameters.frac2}/"
+            f"{parameters.mod2}) / {parameters.mod1}) / "
+            f"{parameters.rf_divider} = "
+            f"{float(multiplier):.9f}"
+        )
     if parameters.negative_bleed_enabled:
         print(
             "Negative bleed current: enabled; "
@@ -2967,6 +2991,7 @@ def run_verification() -> None:
         enable_rfout_a=True,
     )
     assert not integer_parameters.negative_bleed_enabled
+    assert rfouta_pfd_multiplier(integer_parameters) == 16
     assert integer_parameters.negative_bleed_current_code == 0
     assert integer_parameters.negative_bleed_current_ma == 0
     assert not integer_register_6 & R6_NEGATIVE_BLEED_ENABLE_MASK
@@ -2978,6 +3003,7 @@ def run_verification() -> None:
         / charge_pump_current_ma(parameters.charge_pump_current_code)
     )
     assert parameters.negative_bleed_enabled
+    assert rfouta_pfd_multiplier(parameters) == Fraction(144, 5)
     assert parameters.negative_bleed_current_code == 18
     assert fractional_register_6 & R6_NEGATIVE_BLEED_ENABLE_MASK
     assert (
