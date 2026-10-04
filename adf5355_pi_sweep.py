@@ -3148,7 +3148,8 @@ def main() -> None:
     script_start_ns = time.monotonic_ns()
 
     parser = argparse.ArgumentParser(
-        description="Continuously sweep ADF5355 RFOUTA through SPI0"
+        description="Continuously sweep ADF5355 RFOUTA through SPI0",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(

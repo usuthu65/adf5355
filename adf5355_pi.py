@@ -1446,7 +1446,8 @@ def spi_speed_arg(value: str) -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Program ADF5355 RFOUTA through Raspberry Pi SPI0"
+        description="Program ADF5355 RFOUTA through Raspberry Pi SPI0",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
