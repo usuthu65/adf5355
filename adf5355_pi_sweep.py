@@ -484,6 +484,17 @@ def print_n_divider_configuration(
         f"FRAC2: {parameters.frac2}, "
         f"MOD2: {parameters.mod2}"
     )
+    reference_to_pfd_divider = parameters.reference_divider
+    reference_to_pfd_description = str(parameters.reference_divider)
+    if parameters.reference_divide_by_2:
+        reference_to_pfd_divider *= 2
+        reference_to_pfd_description += " × 2"
+    print(f"RF divider: {parameters.rf_divider}")
+    print(
+        "Reference-to-PFD divider: "
+        f"{reference_to_pfd_description} = "
+        f"{reference_to_pfd_divider}"
+    )
     multiplier = rfouta_pfd_multiplier(parameters)
     if calculation_mode == "integer-N":
         print(
