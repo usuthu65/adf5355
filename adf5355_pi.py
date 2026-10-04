@@ -197,7 +197,7 @@ Connect ADF5355 MUXOUT, pin 30, to Raspberry Pi GPIO25,
 physical pin 22. Connect the ADF5355 ground to Raspberry Pi ground.
 
 MUXOUT is configured for 3.3 V logic. Do not apply 5 V to GPIO25.
-""".strip()
+""".strip() + "\n"
 
 
 # ============================================================================
@@ -1661,9 +1661,6 @@ def main() -> None:
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
-    if args.verbose:
-        print_n_divider_configuration(parameters)
-
     try:
         with ADF5355(
             max_speed_hz=args.max_speed_hz,
@@ -1705,6 +1702,8 @@ def main() -> None:
         f"PFD: "
         f"{fraction_to_float(parameters.pfd_hz) / 1e6:.9f} MHz"
     )
+    if args.verbose:
+        print_n_divider_configuration(parameters)
     print(f"Reference mode: {parameters.reference_mode}")
     print(f"MUXOUT function: {parameters.muxout_lock_detect}")
     print("MUXOUT logic level: 3.3 V")

@@ -306,7 +306,7 @@ Connect ADF5355 MUXOUT, pin 30, to Raspberry Pi GPIO25,
 physical pin 22. Connect the ADF5355 ground to Raspberry Pi ground.
 
 MUXOUT is configured for 3.3 V logic. Do not apply 5 V to GPIO25.
-""".strip()
+""".strip() + "\n"
 
 
 # ============================================================================
