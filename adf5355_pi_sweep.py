@@ -255,6 +255,7 @@ R6_RFOUTA_ENABLE_MASK = 1 << 6
 R6_RFOUTA_POWER_SHIFT = 4
 R6_CP_BLEED_CURRENT_SHIFT = 13
 R6_CP_BLEED_CURRENT_MASK = 0xFF << R6_CP_BLEED_CURRENT_SHIFT
+NEGATIVE_BLEED_CURRENT_CODE_COUNT = 1 << 8
 
 R10_ADC_CONVERSION_ENABLE_MASK = 1 << 4
 R10_ADC_ENABLE_MASK = 1 << 5
@@ -520,11 +521,7 @@ def print_n_divider_configuration(
             f"{float(multiplier):.9f}"
         )
     if parameters.negative_bleed_enabled:
-        print(
-            "Negative bleed current: enabled; "
-            f"code {parameters.negative_bleed_current_code}; "
-            f"{float(parameters.negative_bleed_current_ma):.6f} mA"
-        )
+        print(negative_bleed_current_report(parameters))
 
 
 def validate_reference_mode(reference_mode: str) -> None:
@@ -710,6 +707,26 @@ def charge_pump_current_ma(code: int) -> Fraction:
     return Fraction((code + 1) * 5, 16)
 
 
+def negative_bleed_current_report(
+    parameters: SynthesizerParameters,
+) -> str:
+    """Describe the selected and maximum negative bleed currents."""
+    maximum_current_ma = (
+        charge_pump_current_ma(parameters.charge_pump_current_code)
+        * Fraction(
+            NEGATIVE_BLEED_CURRENT_CODE_COUNT - 1,
+            NEGATIVE_BLEED_CURRENT_CODE_COUNT,
+        )
+    )
+    return (
+        "Negative bleed current: enabled; "
+        f"code {parameters.negative_bleed_current_code} / "
+        f"NMAX ({NEGATIVE_BLEED_CURRENT_CODE_COUNT}); "
+        f"{float(parameters.negative_bleed_current_ma) * 1000:.3f} uA; "
+        f"maximum {float(maximum_current_ma) * 1000:.3f} uA"
+    )
+
+
 def select_negative_bleed_current_code(
     feedback_counter: int,
 ) -> int:
@@ -717,10 +734,17 @@ def select_negative_bleed_current_code(
     if feedback_counter <= 0:
         raise ValueError("Feedback counter must be positive")
 
-    minimum_code = (4 * 256) // feedback_counter + 1
-    maximum_code = (10 * 256 - 1) // feedback_counter
+    minimum_code = (
+        4 * NEGATIVE_BLEED_CURRENT_CODE_COUNT
+    ) // feedback_counter + 1
+    maximum_code = (
+        10 * NEGATIVE_BLEED_CURRENT_CODE_COUNT - 1
+    ) // feedback_counter
 
-    if not 1 <= minimum_code <= min(0xFF, maximum_code):
+    if not 1 <= minimum_code <= min(
+        NEGATIVE_BLEED_CURRENT_CODE_COUNT - 1,
+        maximum_code,
+    ):
         raise ValueError(
             "No valid negative bleed current is available for INT"
         )
@@ -906,7 +930,10 @@ def calculate_synthesizer_parameters(
         )
         negative_bleed_current_ma = (
             charge_pump_current_ma(charge_pump_current_code)
-            * Fraction(negative_bleed_current_code, 256)
+            * Fraction(
+                negative_bleed_current_code,
+                NEGATIVE_BLEED_CURRENT_CODE_COUNT,
+            )
         )
     else:
         negative_bleed_current_code = 0
@@ -3025,6 +3052,11 @@ def run_verification() -> None:
     assert parameters.negative_bleed_enabled
     assert rfouta_pfd_multiplier(parameters) == Fraction(144, 5)
     assert parameters.negative_bleed_current_code == 18
+    assert (
+        "code 18 / NMAX (256); 219.727 uA; "
+        "maximum 3112.793 uA"
+        in negative_bleed_current_report(parameters)
+    )
     assert fractional_register_6 & R6_NEGATIVE_BLEED_ENABLE_MASK
     assert (
         (fractional_register_6 & R6_CP_BLEED_CURRENT_MASK)
