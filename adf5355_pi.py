@@ -44,8 +44,8 @@ Additional configured fields:
     Register 4 DB7 = 1
         Positive phase-detector polarity
 
-    Register 6 DB20:DB13 = 16
-        CP bleed-current code 16
+    Register 6 negative bleed is disabled for integer-N operation and
+    calculated automatically for fractional-N operation.
 
 Examples:
 
@@ -178,10 +178,6 @@ PHASE_RESYNC_TIMEOUT = 0x041
 DEFAULT_CHARGE_PUMP_CURRENT_CODE = 0b1001
 PHASE_DETECTOR_POLARITY_POSITIVE = True
 
-# Requested Register 6 setting.
-CP_BLEED_CURRENT_CODE = 16
-
-
 DIFFERENTIAL_REFERENCE_WARNING = """
 WARNING: Differential operation selected.
 
@@ -252,6 +248,7 @@ R4_RDIV2_SHIFT = 25
 
 # Register 6.
 R6_RF_DIVIDER_SHIFT = 21
+R6_NEGATIVE_BLEED_ENABLE_MASK = 1 << 29
 R6_FEEDBACK_FUNDAMENTAL_MASK = 1 << 24
 R6_MUTE_TILL_LOCK_MASK = 1 << 11
 R6_RFOUTB_ENABLE_MASK = 1 << 10
@@ -328,6 +325,12 @@ def print_n_divider_configuration(
         f"FRAC2: {parameters.frac2}, "
         f"MOD2: {parameters.mod2}"
     )
+    if parameters.negative_bleed_enabled:
+        print(
+            "Negative bleed current: enabled; "
+            f"code {parameters.negative_bleed_current_code}; "
+            f"{float(parameters.negative_bleed_current_ma):.6f} mA"
+        )
 
 
 def validate_reference_mode(reference_mode: str) -> None:
@@ -366,14 +369,6 @@ def validate_charge_pump_current_code(code: int) -> None:
     if not 0 <= code <= 0xF:
         raise ValueError(
             "Charge-pump current code must be an integer from 0 to 15"
-        )
-
-
-def validate_configuration_codes() -> None:
-    """Validate fixed Register 4 and Register 6 configuration fields."""
-    if not 0 <= CP_BLEED_CURRENT_CODE <= 0xFF:
-        raise ValueError(
-            "CP bleed-current code must fit in eight bits"
         )
 
 
@@ -511,6 +506,10 @@ class SynthesizerParameters:
     frac2: int
     mod2: int
 
+    negative_bleed_enabled: bool
+    negative_bleed_current_code: int
+    negative_bleed_current_ma: Fraction
+
     adc_clock: ADCClockConfiguration
 
 
@@ -557,6 +556,30 @@ def choose_reference_configuration(
     return reference_divider, reference_divide_by_2, pfd_hz
 
 
+def charge_pump_current_ma(code: int) -> Fraction:
+    """Return the nominal charge-pump current in mA for a Register 4 code."""
+    validate_charge_pump_current_code(code)
+    return Fraction((code + 1) * 5, 16)
+
+
+def select_negative_bleed_current_code(
+    feedback_counter: int,
+) -> int:
+    """Select the lowest 1/256 ICP bleed ratio above 4 / feedback_counter."""
+    if feedback_counter <= 0:
+        raise ValueError("Feedback counter must be positive")
+
+    minimum_code = (4 * 256) // feedback_counter + 1
+    maximum_code = (10 * 256 - 1) // feedback_counter
+
+    if not 1 <= minimum_code <= min(0xFF, maximum_code):
+        raise ValueError(
+            "No valid negative bleed current is available for INT"
+        )
+
+    return minimum_code
+
+
 def calculate_synthesizer_parameters(
     rf_out_hz: int,
     reference_hz: int = DEFAULT_REFERENCE_HZ,
@@ -566,7 +589,6 @@ def calculate_synthesizer_parameters(
     mute_till_lock: bool = DEFAULT_MUTE_TILL_LOCK,
     charge_pump_current_code: int = DEFAULT_CHARGE_PUMP_CURRENT_CODE,
 ) -> SynthesizerParameters:
-    validate_configuration_codes()
     validate_reference_mode(reference_mode)
     validate_muxout_lock_detect(muxout_lock_detect)
     validate_charge_pump_current_code(charge_pump_current_code)
@@ -629,6 +651,19 @@ def calculate_synthesizer_parameters(
     if not MIN_FRAC2 <= frac2 < mod2:
         raise ValueError("Calculated FRAC2 is invalid")
 
+    negative_bleed_enabled = frac1 != 0 or frac2 != 0
+    if negative_bleed_enabled:
+        negative_bleed_current_code = (
+            select_negative_bleed_current_code(int_value)
+        )
+        negative_bleed_current_ma = (
+            charge_pump_current_ma(charge_pump_current_code)
+            * Fraction(negative_bleed_current_code, 256)
+        )
+    else:
+        negative_bleed_current_code = 0
+        negative_bleed_current_ma = Fraction(0, 1)
+
     return SynthesizerParameters(
         rf_out_hz=rf_out_hz,
         reference_hz=reference_hz,
@@ -647,6 +682,9 @@ def calculate_synthesizer_parameters(
         mod1=MOD1,
         frac2=frac2,
         mod2=mod2,
+        negative_bleed_enabled=negative_bleed_enabled,
+        negative_bleed_current_code=negative_bleed_current_code,
+        negative_bleed_current_ma=negative_bleed_current_ma,
         adc_clock=calculate_adc_clock(pfd_hz),
     )
 
@@ -720,16 +758,17 @@ def make_register_6(
     enable_rfout_a: bool,
 ) -> int:
     validate_rf_output_power(output_power_dbm)
-    validate_configuration_codes()
 
     value = 0x14000000 | REG_R6
     value |= RF_DIVIDER_TO_CODE[parameters.rf_divider] << R6_RF_DIVIDER_SHIFT
     value |= R6_FEEDBACK_FUNDAMENTAL_MASK
 
-    value |= (
-        CP_BLEED_CURRENT_CODE
-        << R6_CP_BLEED_CURRENT_SHIFT
-    )
+    if parameters.negative_bleed_enabled:
+        value |= R6_NEGATIVE_BLEED_ENABLE_MASK
+        value |= (
+            parameters.negative_bleed_current_code
+            << R6_CP_BLEED_CURRENT_SHIFT
+        )
 
     value |= (
         RF_OUTPUT_POWER_TO_CODE[output_power_dbm]
@@ -1228,6 +1267,37 @@ def run_verification() -> None:
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
 
+    integer_parameters = calculate_synthesizer_parameters(
+        1_000_000_000,
+        reference_hz=125_000_000,
+    )
+    integer_register_6 = make_register_6(
+        integer_parameters,
+        output_power_dbm=5,
+        enable_rfout_a=True,
+    )
+    assert not integer_parameters.negative_bleed_enabled
+    assert integer_parameters.negative_bleed_current_code == 0
+    assert integer_parameters.negative_bleed_current_ma == 0
+    assert not integer_register_6 & R6_NEGATIVE_BLEED_ENABLE_MASK
+    assert not integer_register_6 & R6_CP_BLEED_CURRENT_MASK
+
+    fractional_register_6 = registers[REG_R6]
+    bleed_ratio = (
+        parameters.negative_bleed_current_ma
+        / charge_pump_current_ma(parameters.charge_pump_current_code)
+    )
+    assert parameters.negative_bleed_enabled
+    assert parameters.negative_bleed_current_code == 14
+    assert fractional_register_6 & R6_NEGATIVE_BLEED_ENABLE_MASK
+    assert (
+        (fractional_register_6 & R6_CP_BLEED_CURRENT_MASK)
+        >> R6_CP_BLEED_CURRENT_SHIFT
+        == parameters.negative_bleed_current_code
+    )
+    assert Fraction(4, parameters.int_value) < bleed_ratio
+    assert bleed_ratio < Fraction(10, parameters.int_value)
+
     for charge_pump_current_code in range(16):
         charge_pump_parameters = calculate_synthesizer_parameters(
             2_400_000_000,
@@ -1607,6 +1677,14 @@ def main() -> None:
         f"code {parameters.charge_pump_current_code} "
         f"({(parameters.charge_pump_current_code + 1) * 0.3125:.4f} mA)"
     )
+    if parameters.negative_bleed_enabled:
+        print(
+            "Negative bleed current: enabled; "
+            f"code {parameters.negative_bleed_current_code}; "
+            f"{float(parameters.negative_bleed_current_ma):.6f} mA"
+        )
+    else:
+        print("Negative bleed current: disabled (integer-N mode)")
     print(f"RFOUTA power: {output_power_dbm:+d} dBm")
     print("RFOUTB enabled: False")
 
