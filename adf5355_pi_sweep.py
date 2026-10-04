@@ -184,7 +184,7 @@ VCO_BAND_SELECTION_CYCLES = 11
 
 PHASE_RESYNC_TIMEOUT = 0x041
 
-CHARGE_PUMP_CURRENT_CODE = 9
+DEFAULT_CHARGE_PUMP_CURRENT_CODE = 9
 PHASE_DETECTOR_POLARITY_POSITIVE = True
 CP_BLEED_CURRENT_CODE = 16
 
@@ -405,6 +405,7 @@ class SynthesizerParameters:
     channel_spacing_hz: int
     muxout_lock_detect: str
     mute_till_lock: bool
+    charge_pump_current_code: int
 
     rf_divider: int
     vco_hz: int
@@ -506,10 +507,15 @@ def validate_rf_output_power(output_power_dbm: int) -> None:
         )
 
 
-def validate_fixed_configuration() -> None:
-    if not 0 <= CHARGE_PUMP_CURRENT_CODE <= 0xF:
-        raise ValueError("Invalid charge-pump-current code")
+def validate_charge_pump_current_code(code: int) -> None:
+    """Validate the ADF5355's four-bit charge-pump current setting."""
+    if not 0 <= code <= 0xF:
+        raise ValueError(
+            "Charge-pump current code must be an integer from 0 to 15"
+        )
 
+
+def validate_fixed_configuration() -> None:
     if not 0 <= CP_BLEED_CURRENT_CODE <= 0xFF:
         raise ValueError("Invalid CP bleed-current code")
 
@@ -663,6 +669,7 @@ def calculate_synthesizer_parameters(
     channel_spacing_hz: int = DEFAULT_CHANNEL_SPACING_HZ,
     muxout_lock_detect: str = DEFAULT_MUXOUT_LOCK_DETECT,
     mute_till_lock: bool = DEFAULT_MUTE_TILL_LOCK,
+    charge_pump_current_code: int = DEFAULT_CHARGE_PUMP_CURRENT_CODE,
     reference_configuration: Optional[
         ReferenceConfiguration
     ] = None,
@@ -685,6 +692,7 @@ def calculate_synthesizer_parameters(
 
     validate_fixed_configuration()
     validate_muxout_lock_detect(muxout_lock_detect)
+    validate_charge_pump_current_code(charge_pump_current_code)
 
     if not MIN_RF_OUTPUT_HZ <= rf_out_hz <= MAX_RF_OUTPUT_HZ:
         raise ValueError("RFOUTA frequency is outside the allowed range")
@@ -854,6 +862,7 @@ def calculate_synthesizer_parameters(
             channel_spacing_hz=channel_spacing_hz,
             muxout_lock_detect=muxout_lock_detect,
             mute_till_lock=mute_till_lock,
+            charge_pump_current_code=charge_pump_current_code,
             rf_divider=rf_divider,
             vco_hz=vco_hz,
             pfd_hz=pfd_hz,
@@ -873,6 +882,9 @@ def calculate_synthesizer_parameters(
         parameters_out.channel_spacing_hz = channel_spacing_hz
         parameters_out.muxout_lock_detect = muxout_lock_detect
         parameters_out.mute_till_lock = mute_till_lock
+        parameters_out.charge_pump_current_code = (
+            charge_pump_current_code
+        )
         parameters_out.rf_divider = rf_divider
         parameters_out.vco_hz = vco_hz
         parameters_out.pfd_hz = pfd_hz
@@ -944,7 +956,7 @@ def make_register_4(
         value |= 1 << R4_REFERENCE_MODE_SHIFT
 
     value |= (
-        CHARGE_PUMP_CURRENT_CODE
+        parameters.charge_pump_current_code
         << R4_CHARGE_PUMP_CURRENT_SHIFT
     )
 
@@ -2250,6 +2262,7 @@ def run_sweep(
         args.channel_spacing_hz,
         args.muxout_lock_detect,
         args.mute_till_lock,
+        args.charge_pump_current_code,
         reference_configuration=reference_configuration,
     )
 
@@ -2323,6 +2336,7 @@ def run_sweep(
             args.channel_spacing_hz,
             args.muxout_lock_detect,
             args.mute_till_lock,
+            args.charge_pump_current_code,
             reference_configuration=reference_configuration,
             parameters_out=start_parameters,
             preparation_statistics=preparation_statistics,
@@ -2875,6 +2889,17 @@ def run_verification() -> None:
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
 
+    for charge_pump_current_code in range(16):
+        charge_pump_parameters = calculate_synthesizer_parameters(
+            1_800_000_000,
+            charge_pump_current_code=charge_pump_current_code,
+        )
+        register_4 = make_register_4(charge_pump_parameters)
+        assert (
+            (register_4 >> R4_CHARGE_PUMP_CURRENT_SHIFT) & 0xF
+            == charge_pump_current_code
+        )
+
     differential_parameters = calculate_synthesizer_parameters(
         1_800_000_000,
         reference_hz=125_000_000,
@@ -3157,6 +3182,18 @@ def main() -> None:
         action="store_true",
         default=DEFAULT_MUTE_TILL_LOCK,
         help="enable Register 6 MTLD",
+    )
+
+    parser.add_argument(
+        "--charge-pump-current-code",
+        type=int,
+        choices=range(16),
+        default=DEFAULT_CHARGE_PUMP_CURRENT_CODE,
+        metavar="CODE",
+        help=(
+            "Register 4 charge-pump-current code: 0 to 15 "
+            "(0.3125 to 5.0000 mA)"
+        ),
     )
 
     power_group = parser.add_mutually_exclusive_group()

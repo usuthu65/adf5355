@@ -175,7 +175,7 @@ PHASE_RESYNC_CLOCK_DIVIDER = 1
 PHASE_RESYNC_TIMEOUT = 0x041
 
 # Requested Register 4 settings.
-CHARGE_PUMP_CURRENT_CODE = 0b1001
+DEFAULT_CHARGE_PUMP_CURRENT_CODE = 0b1001
 PHASE_DETECTOR_POLARITY_POSITIVE = True
 
 # Requested Register 6 setting.
@@ -361,13 +361,16 @@ def validate_rf_output_power(output_power_dbm: int) -> None:
         )
 
 
-def validate_configuration_codes() -> None:
-    """Validate fixed Register 4 and Register 6 configuration fields."""
-    if not 0 <= CHARGE_PUMP_CURRENT_CODE <= 0xF:
+def validate_charge_pump_current_code(code: int) -> None:
+    """Validate the ADF5355's four-bit charge-pump current setting."""
+    if not 0 <= code <= 0xF:
         raise ValueError(
-            "Charge-pump-current code must fit in four bits"
+            "Charge-pump current code must be an integer from 0 to 15"
         )
 
+
+def validate_configuration_codes() -> None:
+    """Validate fixed Register 4 and Register 6 configuration fields."""
     if not 0 <= CP_BLEED_CURRENT_CODE <= 0xFF:
         raise ValueError(
             "CP bleed-current code must fit in eight bits"
@@ -493,6 +496,7 @@ class SynthesizerParameters:
     channel_spacing_hz: int
     muxout_lock_detect: str
     mute_till_lock: bool
+    charge_pump_current_code: int
 
     rf_divider: int
     vco_hz: int
@@ -560,10 +564,12 @@ def calculate_synthesizer_parameters(
     channel_spacing_hz: int = DEFAULT_CHANNEL_SPACING_HZ,
     muxout_lock_detect: str = DEFAULT_MUXOUT_LOCK_DETECT,
     mute_till_lock: bool = DEFAULT_MUTE_TILL_LOCK,
+    charge_pump_current_code: int = DEFAULT_CHARGE_PUMP_CURRENT_CODE,
 ) -> SynthesizerParameters:
     validate_configuration_codes()
     validate_reference_mode(reference_mode)
     validate_muxout_lock_detect(muxout_lock_detect)
+    validate_charge_pump_current_code(charge_pump_current_code)
 
     if not MIN_RF_OUTPUT_HZ <= rf_out_hz <= MAX_RF_OUTPUT_HZ:
         raise ValueError("RFOUTA frequency is outside the allowed range")
@@ -630,6 +636,7 @@ def calculate_synthesizer_parameters(
         channel_spacing_hz=channel_spacing_hz,
         muxout_lock_detect=muxout_lock_detect,
         mute_till_lock=mute_till_lock,
+        charge_pump_current_code=charge_pump_current_code,
         rf_divider=rf_divider,
         vco_hz=vco_hz,
         pfd_hz=pfd_hz,
@@ -689,7 +696,7 @@ def make_register_4(
         value |= 1 << R4_REFERENCE_MODE_SHIFT
 
     value |= (
-        CHARGE_PUMP_CURRENT_CODE
+        parameters.charge_pump_current_code
         << R4_CHARGE_PUMP_CURRENT_SHIFT
     )
 
@@ -1221,6 +1228,18 @@ def run_verification() -> None:
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
 
+    for charge_pump_current_code in range(16):
+        charge_pump_parameters = calculate_synthesizer_parameters(
+            2_400_000_000,
+            charge_pump_current_code=charge_pump_current_code,
+        )
+        register_4 = make_register_4(charge_pump_parameters)
+        assert (
+            register_4 & R4_CHARGE_PUMP_CURRENT_MASK
+            == charge_pump_current_code
+            << R4_CHARGE_PUMP_CURRENT_SHIFT
+        )
+
     high_pfd_parameters = calculate_synthesizer_parameters(
         2_400_000_000,
         reference_hz=250_000_000,
@@ -1426,6 +1445,18 @@ def main() -> None:
         help="enable Register 6 MTLD",
     )
 
+    parser.add_argument(
+        "--charge-pump-current-code",
+        type=int,
+        choices=range(16),
+        default=DEFAULT_CHARGE_PUMP_CURRENT_CODE,
+        metavar="CODE",
+        help=(
+            "Register 4 charge-pump-current code: 0 to 15 "
+            "(0.3125 to 5.0000 mA)"
+        ),
+    )
+
     power_group = parser.add_mutually_exclusive_group()
 
     power_group.add_argument(
@@ -1507,6 +1538,7 @@ def main() -> None:
             args.channel_spacing_hz,
             args.muxout_lock_detect,
             args.mute_till_lock,
+            args.charge_pump_current_code,
         )
 
         validate_rf_output_power(output_power_dbm)
@@ -1567,6 +1599,11 @@ def main() -> None:
     )
     print(f"Register 12: 0x{make_register_12():08X}")
     print(f"Mute till lock detect: {parameters.mute_till_lock}")
+    print(
+        "Charge-pump current: "
+        f"code {parameters.charge_pump_current_code} "
+        f"({(parameters.charge_pump_current_code + 1) * 0.3125:.4f} mA)"
+    )
     print(f"RFOUTA power: {output_power_dbm:+d} dBm")
     print("RFOUTB enabled: False")
 
