@@ -1134,6 +1134,11 @@ def make_register_6(
     return value
 
 
+def make_rf_outputs_disabled_register() -> int:
+    """Create Register 6 with both RF outputs disabled."""
+    return 0x14000000 | REG_R6
+
+
 def make_register_9(parameters: SynthesizerParameters) -> int:
     """Build Register 9 with datasheet-compliant calibration timing."""
     pfd_hz = parameters.pfd_hz
@@ -1676,6 +1681,10 @@ class ADF5355:
         end_ns = time.monotonic_ns()
 
         return start_ns, end_ns
+
+    def disable_rf_outputs(self) -> None:
+        """Write Register 6 with RFOUTA and RFOUTB both disabled."""
+        self._write_register(make_rf_outputs_disabled_register())
 
     @staticmethod
     def wait_until(deadline_ns: int) -> None:
@@ -3019,6 +3028,9 @@ def run_verification() -> None:
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
     assert not registers[REG_R6] & R6_RFOUTB_ENABLE_MASK
+    disabled_outputs_register = make_rf_outputs_disabled_register()
+    assert not disabled_outputs_register & R6_RFOUTA_ENABLE_MASK
+    assert not disabled_outputs_register & R6_RFOUTB_ENABLE_MASK
 
     rfout_b_register_6 = make_register_6(
         parameters,
@@ -3112,6 +3124,8 @@ def run_verification() -> None:
 
     device._write_register(REG_R6 | R6_RFOUTB_ENABLE_MASK)
     assert fake_spi.transfers[-1] == [0, 0, 4, 6]
+    device.disable_rf_outputs()
+    assert fake_spi.transfers[-1] == [0x14, 0, 0, 6]
 
     device.close()
 
@@ -3384,7 +3398,7 @@ def main() -> None:
     power_group.add_argument(
         "--disable-rf-output",
         action="store_true",
-        help="disable RFOUTA",
+        help="disable RFOUTA and RFOUTB; works without a frequency",
     )
 
     parser.add_argument(
@@ -3417,6 +3431,16 @@ def main() -> None:
 
     if args.verify:
         run_verification()
+        return
+
+    if args.disable_rf_output:
+        try:
+            with ADF5355(max_speed_hz=args.max_speed_hz) as device:
+                device.disable_rf_outputs()
+        except (TypeError, ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+
+        print("RFOUTA and RFOUTB disabled through SPI0 CE0")
         return
 
     if args.reference_mode == REFERENCE_MODE_DIFFERENTIAL:
