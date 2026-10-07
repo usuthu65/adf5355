@@ -330,7 +330,7 @@ def print_reference_to_pfd_divider(
     reference_to_pfd_description = str(parameters.reference_divider)
     if parameters.reference_divide_by_2:
         reference_to_pfd_divider *= 2
-        reference_to_pfd_description += " × 2"
+        reference_to_pfd_description += " Ã 2"
     print(
         "Reference-to-PFD divider: "
         f"{reference_to_pfd_description} = "
@@ -1827,3 +1827,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

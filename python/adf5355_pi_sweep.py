@@ -482,7 +482,7 @@ def print_pfd_and_reference_divider(
     reference_to_pfd_description = str(parameters.reference_divider)
     if parameters.reference_divide_by_2:
         reference_to_pfd_divider *= 2
-        reference_to_pfd_description += " × 2"
+        reference_to_pfd_description += " Ã 2"
     print(f"PFD: {float(parameters.pfd_hz) / 1e6:.9f} MHz")
     print(
         "Reference-to-PFD divider: "
@@ -3576,3 +3576,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
