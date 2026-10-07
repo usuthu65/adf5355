@@ -41,4 +41,22 @@ rail; do not connect it to SPI0 CE0.
 
 ## C
 
-See c/README.md for the no-OS setup, build, and run commands.
+Install the build prerequisites and enable SPI0:
+
+~~~sh
+sudo apt update
+sudo apt install -y build-essential git
+sudo raspi-config nonint do_spi 0
+sudo reboot
+~~~
+
+After the Pi has restarted, clone the ADI no-OS repository alongside this
+repository, then build the C example:
+
+~~~sh
+git clone --depth 1 https://github.com/analogdevicesinc/no-OS ../no-OS
+cd c
+make
+~~~
+
+See c/README.md for the no-OS wiring details and run commands.
