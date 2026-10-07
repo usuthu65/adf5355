@@ -12,9 +12,11 @@ CFLAGS ?= -O2 -Wall -Wextra -std=c11
 TARGET := adf5355_noos_example
 SOURCES := adf5355_noos_example.c \
            $(NO_OS_DIR)/drivers/frequency/adf5355/adf5355.c \
+           $(NO_OS_DIR)/drivers/api/no_os_spi.c \
            $(NO_OS_DIR)/drivers/platform/linux-userspace/linux_spi.c \
            $(NO_OS_DIR)/drivers/platform/linux-userspace/linux_delay.c \
            $(NO_OS_DIR)/util/no_os_alloc.c \
+           $(NO_OS_DIR)/util/no_os_mutex.c \
            $(NO_OS_DIR)/util/no_os_util.c
 
 .PHONY: all clean
