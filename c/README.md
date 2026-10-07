@@ -49,6 +49,10 @@ selects a 3.125 mA charge-pump current and enables fractional-N negative
 bleed. The no-OS driver automatically disables negative bleed for integer-N
 frequencies and for PFD frequencies above 100 MHz.
 
+**NOTE** 
 This is a starting point, not a lock/settling-time measurement application.
 The physical loop filter must be appropriate for the selected charge-pump
 current before using it for RF-quality measurements.
+
+This has not yet been thoroughly tested; user beware.  The code was written based
+on the ADI given driver by GPT 5.6 Terra medium.
