@@ -44,15 +44,27 @@ sudo ./adf5355_noos_example
 sudo ./adf5355_noos_example 1000000000
 ~~~
 
+Use --help to see every default, fixed parameter, and supported option:
+
+~~~sh
+./adf5355_noos_example --help
+~~~
+
 The default is RFOUTA = 2.1 GHz, from the board's 125 MHz reference. It
 selects a 3.125 mA charge-pump current and enables fractional-N negative
 bleed. The no-OS driver automatically disables negative bleed for integer-N
-frequencies and for PFD frequencies above 100 MHz.
+frequencies and for PFD frequencies above 100 MHz. For example:
 
-**NOTE** 
+~~~sh
+sudo ./adf5355_noos_example --rf-output-hz 1002500000 \
+  --reference-hz 125000000 --charge-pump-current-ua 3125 \
+  --rf-output-power 2 --muxout digital --verbose
+~~~
+
+The ADI API automatically chooses the R counter and MOD2; it has no
+channel-spacing control. This C utility also does not provide the Python
+programs' Raspberry Pi GPIO digital-lock wait or lock-time measurement.
+
 This is a starting point, not a lock/settling-time measurement application.
 The physical loop filter must be appropriate for the selected charge-pump
 current before using it for RF-quality measurements.
-
-This has not yet been thoroughly tested; user beware.  The code was written based
-on the ADI given driver by GPT 5.6 Terra medium.
