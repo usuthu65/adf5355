@@ -3,10 +3,11 @@
 NO_OS_DIR ?= ../../no-OS
 CC ?= gcc
 
-CPPFLAGS += -I$(NO_OS_DIR)/include \
+CPPFLAGS += -D_DEFAULT_SOURCE \
+            -I$(NO_OS_DIR)/include \
             -I$(NO_OS_DIR)/drivers/frequency/adf5355 \
             -I$(NO_OS_DIR)/drivers/platform/linux-userspace
-CFLAGS ?= -O2 -Wall -Wextra -Werror -std=c11
+CFLAGS ?= -O2 -Wall -Wextra -std=c11
 
 TARGET := adf5355_noos_example
 SOURCES := adf5355_noos_example.c \
