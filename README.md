@@ -1,7 +1,11 @@
 # ADF5355 Raspberry Pi examples
 
 This repository contains Raspberry Pi userspace examples for an ADF5355
-wideband synthesizer board.
+wideband synthesizer board labeled "ADF535X EVAL NWDZ V2.0", provided
+with a default 125 MHz crystal basd onboard XO.
+
+The schematic is likely similar or identical to 
+http://gm8bjf.joomla.com/images/pdf/ADF5355_sch.pdf.
 
 ## Layout
 
