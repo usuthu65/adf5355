@@ -145,6 +145,7 @@ MIN_R_COUNTER = 1
 MAX_R_COUNTER = 1023
 
 MIN_INT_4_5_PRESCALER = 23
+MIN_INT_8_9_PRESCALER = 75
 MAX_INT_4_5_PRESCALER = 32_767
 
 MOD1 = 2**24
@@ -168,7 +169,9 @@ REQUIRED_ADC_CYCLES = 16
 TIMING_MARGIN_NS = 10_000
 NS_PER_SECOND = 1_000_000_000
 
-REGISTER_7_VALUE = 0x120000E7
+# Keep loss-of-lock mode disabled. It is intended for fixed-frequency
+# applications where the reference may disappear, not normal tuning.
+REGISTER_7_VALUE = 0x12000067
 
 # Register 9 timing fields. These must be calculated from fPFD; a fixed
 # Register 9 value is not valid when the reference configuration changes.
@@ -230,6 +233,7 @@ REG_R12 = 12
 # ============================================================================
 
 R0_INT_SHIFT = 4
+R0_PRESCALER_SHIFT = 20
 R0_AUTOCAL_SHIFT = 21
 
 R1_FRAC1_SHIFT = 4
@@ -238,6 +242,7 @@ R2_MOD2_SHIFT = 4
 R2_FRAC2_SHIFT = 18
 
 R4_COUNTER_RESET_MASK = 1 << 4
+R4_DOUBLE_BUFFER_MASK = 1 << 14
 R4_PHASE_DETECTOR_POLARITY_MASK = 1 << 7
 R4_MUXOUT_SHIFT = 27
 R4_MUXOUT_LOGIC_SHIFT = 8
@@ -923,7 +928,12 @@ def calculate_synthesizer_parameters(
     if not MIN_FRAC2 <= frac2 < mod2:
         raise ValueError("Calculated FRAC2 is invalid")
 
-    negative_bleed_enabled = frac1 != 0 or frac2 != 0
+    # The ADF5355 specifies negative bleed only for fractional-N operation
+    # with fPFD no greater than 100 MHz.
+    negative_bleed_enabled = (
+        (frac1 != 0 or frac2 != 0)
+        and pfd_hz <= 100_000_000
+    )
     if negative_bleed_enabled:
         negative_bleed_current_code = (
             select_negative_bleed_current_code(int_value)
@@ -1040,6 +1050,9 @@ def make_register_0(
 ) -> int:
     value = REG_R0 | (parameters.int_value << R0_INT_SHIFT)
 
+    if parameters.int_value >= MIN_INT_8_9_PRESCALER:
+        value |= 1 << R0_PRESCALER_SHIFT
+
     if autocal_enabled:
         value |= 1 << R0_AUTOCAL_SHIFT
 
@@ -1081,6 +1094,10 @@ def make_register_4(
 
     if PHASE_DETECTOR_POLARITY_POSITIVE:
         value |= R4_PHASE_DETECTOR_POLARITY_MASK
+
+    # Double-buffer the R counter and reference-path settings so that a
+    # frequency update takes effect coherently with the R0 write.
+    value |= R4_DOUBLE_BUFFER_MASK
 
     value |= parameters.reference_divider << R4_R_COUNTER_SHIFT
 
@@ -3022,8 +3039,10 @@ def run_verification() -> None:
         enable_rfout_a=True,
     )
 
-    assert registers[REG_R4] == 0x3200A584
-    assert registers[REG_R7] == 0x120000E7
+    assert registers[REG_R4] == 0x3200E584
+    assert registers[REG_R7] == 0x12000067
+    assert not registers[REG_R0] & (1 << R0_PRESCALER_SHIFT)
+    assert registers[REG_R4] & R4_DOUBLE_BUFFER_MASK
     assert registers[REG_R9] == 0x1B1A7CC9
     assert registers[REG_R10] == 0x00C0273A
     assert registers[REG_R12] == 0x0001041C
@@ -3102,7 +3121,7 @@ def run_verification() -> None:
         enable_rfout_a=True,
     )
 
-    assert differential_registers[REG_R4] == 0x3200A784
+    assert differential_registers[REG_R4] == 0x3200E784
 
     high_pfd_parameters = calculate_synthesizer_parameters(
         1_800_000_000,
@@ -3112,6 +3131,8 @@ def run_verification() -> None:
     )
 
     assert high_pfd_parameters.pfd_hz == 125_000_000
+    assert not high_pfd_parameters.negative_bleed_enabled
+    assert high_pfd_parameters.negative_bleed_current_code == 0
     assert make_register_9(high_pfd_parameters) == 0x35347CC9
 
     run_sequence_construction_regression_test()
