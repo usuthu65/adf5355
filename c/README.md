@@ -2,9 +2,10 @@
 
 adf5355_noos_example.c is a one-shot RFOUTA program using Analog Devices'
 current [no-OS ADF5355 driver](https://github.com/analogdevicesinc/no-OS/tree/main/drivers/frequency/adf5355).
-The ADI module performs the register calculations and writes the registers over
-SPI; this repository supplies only the Linux userspace application and build
-recipe.
+The ADI module supplies the device lifecycle and Linux SPI abstraction. The
+application supplies a Python-compatible register layer, because the immutable
+ADI source has known ADF5355 Register 2, Register 6, and Register 7
+differences.
 
 ## Raspberry Pi wiring
 
@@ -50,25 +51,31 @@ Use --help to see every default, fixed parameter, and supported option:
 ./adf5355_noos_example --help
 ~~~
 
-Use --verbose to print the calculated registers in the same Register 12
-through Register 0 initialization order and Step/13 layout as the Python
-programs. The ADI Linux backend does not report individual SPI-transfer
-timestamps, so the C report prints its start, end, transfer, and gap fields as
-n/a; the register number and hexadecimal value fields are directly comparable.
+Use --verbose to print the exact corrected 32-bit words transmitted to the
+ADF5355 in the same Register 12 through Register 0 initialization order and
+Step/13 layout as the Python programs. The ADI Linux backend does not report
+individual SPI-transfer timestamps, so the C report prints its start, end,
+transfer, and gap fields as n/a.
+
+Use --dry-run to calculate and report those same words without opening SPI:
+
+~~~sh
+./adf5355_noos_example --dry-run --rf-output-hz 1000000000 +  --rf-output-power 2 --muxout digital
+~~~
 
 The default is RFOUTA = 2.1 GHz, from the board's 125 MHz reference. It
 selects a 3.125 mA charge-pump current and enables fractional-N negative
-bleed. The no-OS driver automatically disables negative bleed for integer-N
-frequencies and for PFD frequencies above 100 MHz. For example:
+bleed where the ADF5355 permits it. The default channel spacing is 200 kHz,
+matching the Python program. For example:
 
 ~~~sh
 sudo ./adf5355_noos_example --rf-output-hz 1002500000 \
   --reference-hz 125000000 --charge-pump-current-ua 3125 \
-  --rf-output-power 2 --muxout digital --verbose
+  --channel-spacing-hz 200000 --rf-output-power 2 --muxout digital --verbose
 ~~~
 
-The ADI API automatically chooses the R counter and MOD2; it has no
-channel-spacing control. This C utility also does not provide the Python
+The compatibility layer chooses R counter, MOD2, and bleed-current values
+using the Python program's rules. This C utility does not provide the Python
 programs' Raspberry Pi GPIO digital-lock wait or lock-time measurement.
 
 This is a starting point, not a lock/settling-time measurement application.
