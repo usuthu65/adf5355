@@ -50,6 +50,12 @@ Use --help to see every default, fixed parameter, and supported option:
 ./adf5355_noos_example --help
 ~~~
 
+Use --verbose to print the calculated registers in the same Register 12
+through Register 0 initialization order and Step/13 layout as the Python
+programs. The ADI Linux backend does not report individual SPI-transfer
+timestamps, so the C report prints its start, end, transfer, and gap fields as
+n/a; the register number and hexadecimal value fields are directly comparable.
+
 The default is RFOUTA = 2.1 GHz, from the board's 125 MHz reference. It
 selects a 3.125 mA charge-pump current and enables fractional-N negative
 bleed. The no-OS driver automatically disables negative bleed for integer-N

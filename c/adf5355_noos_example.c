@@ -199,6 +199,22 @@ static const char *muxout_name(enum adf5355_mux_out_sel muxout)
 	return names[muxout];
 }
 
+static void print_initialization_register_report(
+	const struct adf5355_dev *device)
+{
+	unsigned int step;
+	unsigned int reg;
+
+	printf("Beginning Register Initialization Sequence: 13 register writes\n");
+	for (step = 1; step <= 13; step++) {
+		reg = 13 - step;
+		printf(
+			"Step %02u/13: initialization; Register %u; value=0x%08"
+			PRIX32 "; start=n/a; end=n/a; transfer=n/a; gap=n/a\n",
+			step, reg, device->regs[reg]);
+	}
+}
+
 static void print_configuration(const struct adf5355_init_param *init,
 				const struct no_os_spi_init_param *spi,
 				const struct adf5355_dev *device,
@@ -209,7 +225,6 @@ static void print_configuration(const struct adf5355_init_param *init,
 	uint32_t bleed_code = (device->regs[ADF5355_REG(6)] >> 13) & 0xFF;
 	bool negative_bleed = (device->regs[ADF5355_REG(6)] >> 29) & 1;
 	bool gated_bleed = (device->regs[ADF5355_REG(6)] >> 30) & 1;
-	unsigned int reg;
 
 	printf("ADF5355 configuration:\n");
 	printf("  RFOUTA: %" PRIu64 " Hz (%s-N)\n", device->freq_req,
@@ -239,9 +254,7 @@ static void print_configuration(const struct adf5355_init_param *init,
 	if (!verbose)
 		return;
 
-	printf("  Register map:\n");
-	for (reg = 0; reg <= 12; reg++)
-		printf("    R%u = 0x%08" PRIX32 "\n", reg, device->regs[reg]);
+	print_initialization_register_report(device);
 }
 
 int main(int argc, char **argv)
