@@ -51,16 +51,18 @@ Use --help to see every default, fixed parameter, and supported option:
 ./adf5355_noos_example --help
 ~~~
 
-Use --verbose to print the exact corrected 32-bit words transmitted to the
-ADF5355 in the same Register 12 through Register 0 initialization order and
-Step/13 layout as the Python programs. The ADI Linux backend does not report
-individual SPI-transfer timestamps, so the C report prints its start, end,
-transfer, and gap fields as n/a.
+Normal successful programming is silent. Use --verbose to print the selected
+configuration and the exact corrected 32-bit words transmitted to the ADF5355
+in the same Register 12 through Register 0 initialization order and Step/13
+layout as the Python programs. The ADI Linux backend does not report individual
+SPI-transfer timestamps, so the C report prints its start, end, transfer, and
+gap fields as n/a.
 
 Use --dry-run to calculate and report those same words without opening SPI:
 
 ~~~sh
-./adf5355_noos_example --dry-run --rf-output-hz 1000000000 +  --rf-output-power 2 --muxout digital
+./adf5355_noos_example --dry-run --rf-output-hz 1000000000 \
+  --rf-output-power 2 --muxout digital
 ~~~
 
 The default is RFOUTA = 2.1 GHz, from the board's 125 MHz reference. It

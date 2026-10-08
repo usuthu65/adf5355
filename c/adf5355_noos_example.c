@@ -519,7 +519,7 @@ static void print_usage(const char *program)
 		"                              high, low, or three-state\n"
 		"      --spi-device N | --spi-chip-select N\n"
 		"      --dry-run                Calculate and print; do not open SPI\n"
-		"  -v, --verbose                Print corrected transmitted words\n"
+		"  -v, --verbose                Print configuration and corrected words\n"
 		"  -h, --help                   Show this help and exit\n",
 		program, (uint64_t)DEFAULT_RFOUTA_HZ,
 		(uint32_t)DEFAULT_REFERENCE_HZ,
@@ -737,8 +737,9 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	print_configuration(&init, &spi_init, &parameters, output_power_dbm,
-			    channel_spacing_hz, verbose);
+	if (verbose)
+		print_configuration(&init, &spi_init, &parameters, output_power_dbm,
+				    channel_spacing_hz, true);
 
 	ret = adf5355_remove(adf5355);
 	if (ret) {
