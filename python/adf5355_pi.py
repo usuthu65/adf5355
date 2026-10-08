@@ -158,10 +158,11 @@ ADC_CLK_DIV_MAX = 255
 REQUIRED_ADC_CYCLES = 16
 TIMING_MARGIN_NS = 10_000
 
-# Correct fixed register values.
-# Keep loss-of-lock mode disabled. It is intended for fixed-frequency
-# applications where the reference may disappear, not normal tuning.
-REGISTER_7_VALUE = 0x12000067
+# Register 7 common settings: reserved bits, LE synchronization, and loss of
+# lock disabled.  The lock-detect mode itself must follow the synthesis mode.
+REGISTER_7_COMMON_VALUE = 0x12000060
+REGISTER_7_FRACTIONAL_N_VALUE = REGISTER_7_COMMON_VALUE | 0x07
+REGISTER_7_INTEGER_N_VALUE = REGISTER_7_COMMON_VALUE | 0x17
 
 # Register 9 timing fields. These must be calculated from fPFD; a fixed
 # Register 9 value is not valid when the reference configuration changes.
@@ -873,6 +874,13 @@ def make_register_6(
     return value
 
 
+def make_register_7(parameters: SynthesizerParameters) -> int:
+    """Select the digital-lock mode appropriate to integer or fractional N."""
+    if parameters.frac1 == 0 and parameters.frac2 == 0:
+        return REGISTER_7_INTEGER_N_VALUE
+    return REGISTER_7_FRACTIONAL_N_VALUE
+
+
 def make_rf_outputs_disabled_register() -> int:
     """Create Register 6 with both RF outputs disabled."""
     return 0x14000000 | REG_R6
@@ -972,7 +980,7 @@ def make_register_map(
             enable_rfout_a,
             enable_rfout_b,
         ),
-        REG_R7: REGISTER_7_VALUE,
+        REG_R7: make_register_7(parameters),
         REG_R8: 0x102D0428,
         REG_R9: make_register_9(parameters),
         REG_R10: make_register_10(parameters),
@@ -1372,6 +1380,17 @@ def run_verification() -> None:
     disabled_outputs_register = make_rf_outputs_disabled_register()
     assert not disabled_outputs_register & R6_RFOUTA_ENABLE_MASK
     assert not disabled_outputs_register & R6_RFOUTB_ENABLE_MASK
+
+    integer_parameters = calculate_synthesizer_parameters(
+        1_000_000_000,
+        reference_hz=125_000_000,
+    )
+    integer_registers = make_register_map(
+        integer_parameters,
+        output_power_dbm=2,
+        enable_rfout_a=True,
+    )
+    assert integer_registers[REG_R7] == 0x12000077
 
     rfout_b_register_6 = make_register_6(
         parameters,

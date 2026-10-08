@@ -372,7 +372,14 @@ static int calculate_python_compatible_parameters(
 		if (init->cp_gated_bleed_en)
 			parameters->registers[6] |= 1U << 30;
 	}
-	parameters->registers[7] = 0x12000067U;
+	/*
+	 * DB4 selects the lock-detect mode. Use the fractional-N, 12 ns
+	 * precision mode when either fraction is nonzero; use the 2.9 ns
+	 * integer-N mode otherwise. The other fields retain the Python
+	 * settings: reserved bits, LE synchronization, and LOL disabled.
+	 */
+	parameters->registers[7] = (frac1 || frac2) ?
+		0x12000067U : 0x12000077U;
 	parameters->registers[8] = 0x102D0428U;
 
 	vco_band_divider = ceil_div_u128(pfd_num,
