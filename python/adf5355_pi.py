@@ -31,7 +31,7 @@ RFOUTB is disabled by default and can be enabled explicitly.
 
 Corrected fixed registers:
 
-    Register 7  = 0x120000E7
+    Register 7  = calculated lock-detect mode (integer-N or fractional-N)
     Register 9  = calculated from fPFD for calibration timing
     Register 10 = calculated from fPFD
     Register 12 = 0x0001041C
@@ -576,6 +576,7 @@ def select_rf_divider(rf_out_hz: int) -> int:
 
 def choose_reference_configuration(
     reference_hz: int,
+    reference_divider: Optional[int] = None,
 ) -> tuple[int, bool, Fraction]:
     reference_divide_by_2 = reference_hz >= 20_000_000
 
@@ -584,13 +585,17 @@ def choose_reference_configuration(
         2 if reference_divide_by_2 else 1,
     )
 
-    reference_divider = max(
-        1,
-        ceil_fraction(base_pfd_hz / MAX_PFD_HZ),
-    )
+    if reference_divider is None:
+        reference_divider = max(
+            1,
+            ceil_fraction(base_pfd_hz / MAX_PFD_HZ),
+        )
 
-    if reference_divider > MAX_R_COUNTER:
-        raise ValueError("Reference R counter exceeds its limit")
+    if not MIN_R_COUNTER <= reference_divider <= MAX_R_COUNTER:
+        raise ValueError(
+            "Reference R counter must be between "
+            f"{MIN_R_COUNTER} and {MAX_R_COUNTER}"
+        )
 
     pfd_hz = base_pfd_hz / reference_divider
 
@@ -659,6 +664,7 @@ def calculate_synthesizer_parameters(
     muxout_lock_detect: str = DEFAULT_MUXOUT_LOCK_DETECT,
     mute_till_lock: bool = DEFAULT_MUTE_TILL_LOCK,
     charge_pump_current_code: int = DEFAULT_CHARGE_PUMP_CURRENT_CODE,
+    reference_divider: Optional[int] = None,
 ) -> SynthesizerParameters:
     validate_reference_mode(reference_mode)
     validate_muxout_lock_detect(muxout_lock_detect)
@@ -678,7 +684,7 @@ def calculate_synthesizer_parameters(
         raise ValueError("Channel spacing must be positive")
 
     reference_divider, reference_divide_by_2, pfd_hz = (
-        choose_reference_configuration(reference_hz)
+        choose_reference_configuration(reference_hz, reference_divider)
     )
 
     rf_divider = select_rf_divider(rf_out_hz)
@@ -1392,6 +1398,20 @@ def run_verification() -> None:
     )
     assert integer_registers[REG_R7] == 0x12000077
 
+    divided_reference_parameters = calculate_synthesizer_parameters(
+        1_000_000_000,
+        reference_hz=125_000_000,
+        reference_divider=2,
+    )
+    divided_reference_registers = make_register_map(
+        divided_reference_parameters,
+        output_power_dbm=2,
+        enable_rfout_a=True,
+    )
+    assert divided_reference_parameters.pfd_hz == 31_250_000
+    assert divided_reference_parameters.int_value == 128
+    assert divided_reference_registers[REG_R4] == 0x32016584
+
     rfout_b_register_6 = make_register_6(
         parameters,
         output_power_dbm=5,
@@ -1605,6 +1625,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--reference-divider",
+        type=positive_integer,
+        metavar="R",
+        help=(
+            "override the automatic Register 4 R counter; with a "
+            "125 MHz reference, the normal divide-by-2 path gives "
+            "fPFD = 62.5 MHz / R"
+        ),
+    )
+
+    parser.add_argument(
         "--reference-mode",
         choices=REFERENCE_MODES,
         default=DEFAULT_REFERENCE_MODE,
@@ -1767,6 +1798,7 @@ def main() -> None:
             args.muxout_lock_detect,
             args.mute_till_lock,
             args.charge_pump_current_code,
+            reference_divider=args.reference_divider,
         )
 
         validate_rf_output_power(output_power_dbm)

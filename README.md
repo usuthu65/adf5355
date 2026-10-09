@@ -36,6 +36,13 @@ sudo python3 adf5355_pi.py --rf-output-hz 2100000000 \
   --set-rf-output-power 2 --muxout-lock-detect digital --wait-for-lock
 ~~~
 
+By default, the programs choose the smallest legal Register 4 R counter. To
+diagnose loop behavior at a lower PFD frequency, use `--reference-divider R`.
+For the board's 125 MHz reference, the normal enabled divide-by-2 path gives
+`fPFD = 62.5 MHz / R`; for example, `--reference-divider 2` selects 31.25 MHz.
+The scripts recalculate N, FRAC1, FRAC2, MOD2, Register 9, and Register 10 for
+the selected PFD.
+
 The ADF5355 CE pin is separate from LE. Hold CE high from the board's 3.3 V
 rail; do not connect it to SPI0 CE0.
 

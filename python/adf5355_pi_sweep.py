@@ -58,7 +58,7 @@ Sequence-construction optimization:
 
 Corrected registers:
 
-    Register 7  = 0x120000E7
+    Register 7  = calculated lock-detect mode (integer-N or fractional-N)
     Register 9  = calculated from fPFD for calibration timing
     Register 10 = calculated from fPFD
     Register 12 = 0x0001041C
@@ -660,6 +660,7 @@ def calculate_adc_clock(
 def build_reference_configuration(
     reference_hz: int,
     reference_mode: str,
+    reference_divider: Optional[int] = None,
 ) -> ReferenceConfiguration:
     validate_reference_mode(reference_mode)
 
@@ -677,13 +678,17 @@ def build_reference_configuration(
         2 if reference_divide_by_2 else 1,
     )
 
-    reference_divider = max(
-        1,
-        ceil_fraction(base_pfd_hz / MAX_PFD_HZ),
-    )
+    if reference_divider is None:
+        reference_divider = max(
+            1,
+            ceil_fraction(base_pfd_hz / MAX_PFD_HZ),
+        )
 
-    if reference_divider > MAX_R_COUNTER:
-        raise ValueError("Reference R counter exceeds its limit")
+    if not MIN_R_COUNTER <= reference_divider <= MAX_R_COUNTER:
+        raise ValueError(
+            "Reference R counter must be between "
+            f"{MIN_R_COUNTER} and {MAX_R_COUNTER}"
+        )
 
     pfd_hz = base_pfd_hz / reference_divider
 
@@ -778,6 +783,7 @@ def calculate_synthesizer_parameters(
     preparation_statistics: Optional[
         ParameterPreparationStatistics
     ] = None,
+    reference_divider: Optional[int] = None,
 ) -> SynthesizerParameters:
     profile_start_ns = (
         time.perf_counter_ns()
@@ -804,10 +810,16 @@ def calculate_synthesizer_parameters(
         reference_configuration = build_reference_configuration(
             reference_hz,
             reference_mode,
+            reference_divider,
         )
     elif (
         reference_configuration.reference_hz != reference_hz
         or reference_configuration.reference_mode != reference_mode
+        or (
+            reference_divider is not None
+            and reference_configuration.reference_divider
+            != reference_divider
+        )
     ):
         raise ValueError(
             "Cached reference configuration does not match inputs"
@@ -2006,6 +2018,7 @@ def validate_sweep_arguments(
     channel_spacing_hz: int,
     muxout_lock_detect: str,
     mute_till_lock: bool,
+    reference_divider: Optional[int] = None,
 ) -> None:
     if not MIN_RF_OUTPUT_HZ <= start_frequency <= MAX_RF_OUTPUT_HZ:
         raise ValueError("start_frequency is outside the RFOUTA range")
@@ -2034,6 +2047,15 @@ def validate_sweep_arguments(
 
     if step_time_s <= 0:
         raise ValueError("step_time must be greater than zero")
+
+    if (
+        reference_divider is not None
+        and not MIN_R_COUNTER <= reference_divider <= MAX_R_COUNTER
+    ):
+        raise ValueError(
+            "Reference R counter must be between "
+            f"{MIN_R_COUNTER} and {MAX_R_COUNTER}"
+        )
 
 
 # ============================================================================
@@ -2412,6 +2434,7 @@ def run_sweep(
     reference_configuration = build_reference_configuration(
         args.reference_hz,
         args.reference_mode,
+        args.reference_divider,
     )
 
     start_parameters = calculate_synthesizer_parameters(
@@ -2423,6 +2446,7 @@ def run_sweep(
         args.mute_till_lock,
         args.charge_pump_current_code,
         reference_configuration=reference_configuration,
+        reference_divider=args.reference_divider,
     )
 
     if args.verbose:
@@ -3073,6 +3097,28 @@ def run_verification() -> None:
     )
     assert integer_registers[REG_R7] == 0x12000077
 
+    divided_reference_configuration = build_reference_configuration(
+        125_000_000,
+        REFERENCE_MODE_SINGLE_ENDED,
+        reference_divider=2,
+    )
+    divided_reference_parameters = calculate_synthesizer_parameters(
+        1_000_000_000,
+        reference_hz=125_000_000,
+        reference_mode=REFERENCE_MODE_SINGLE_ENDED,
+        channel_spacing_hz=200_000,
+        reference_configuration=divided_reference_configuration,
+        reference_divider=2,
+    )
+    divided_reference_registers = make_register_map(
+        divided_reference_parameters,
+        output_power_dbm=2,
+        enable_rfout_a=True,
+    )
+    assert divided_reference_parameters.pfd_hz == 31_250_000
+    assert divided_reference_parameters.int_value == 128
+    assert divided_reference_registers[REG_R4] == 0x32016584
+
     rfout_b_register_6 = make_register_6(
         parameters,
         output_power_dbm=5,
@@ -3331,6 +3377,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--reference-divider",
+        type=positive_integer,
+        metavar="R",
+        help=(
+            "override the automatic Register 4 R counter; with a "
+            "125 MHz reference, the normal divide-by-2 path gives "
+            "fPFD = 62.5 MHz / R"
+        ),
+    )
+
+    parser.add_argument(
         "--reference-mode",
         choices=REFERENCE_MODES,
         default=DEFAULT_REFERENCE_MODE,
@@ -3557,6 +3614,7 @@ def main() -> None:
             args.channel_spacing_hz,
             args.muxout_lock_detect,
             args.mute_till_lock,
+            args.reference_divider,
         )
 
         validate_rf_output_power(output_power_dbm)
